@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OTA Server — UDP Settings</title>
+    <meta http-equiv="Content-type" content="text/html; charset=utf-8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <!-- Header -->
+    <h3 class="top">OTA Server.<sup>&copy;</sup></h3>
+    <div class="menu">
+        <div>
+            <a href="/">Main</a>
+            <a href="/devices">Devices</a>
+            <a href="/udp-settings" class="active">UDP Settings</a>
+        </div>
+    </div>
+
+    <!-- UDP Listener Settings -->
+    <h2 class="title" style="background: #7D8EE2">UDP Listener Settings</h2>
+    <p style="text-align:center; font-size:13px; color:#666; margin-bottom:10px;">
+        Configure UDP broadcast listener for device discovery.
+        Based on AppSettings.cs (IsListening, ReceivePort, TransmitPort, Keyword).
+    </p>
+
+    <div class="settings-form">
+        <div class="settings-group">
+            <h3>Listener</h3>
+            <div class="setting-row">
+                <label for="is_listening">Is Listening:</label>
+                <input type="checkbox" id="is_listening"
+                       {% if udp_config.is_listening %}checked{% endif %}>
+                <span class="setting-hint">Enable/disable UDP listener</span>
+            </div>
+            <div class="setting-row">
+                <label for="receive_port">Receive Port:</label>
+                <input type="number" id="receive_port" value="{{ udp_config.receive_port }}"
+                       min="1024" max="65535" class="input-num">
+                <span class="setting-hint">Port for listening (default: 40000)</span>
+            </div>
+            <div class="setting-row">
+                <label for="transmit_port">Transmit Port:</label>
+                <input type="number" id="transmit_port" value="{{ udp_config.transmit_port }}"
+                       min="1024" max="65535" class="input-num">
+                <span class="setting-hint">Port for probe broadcasts (default: 40001)</span>
+            </div>
+            <div class="setting-row">
+                <label for="keyword">Keyword:</label>
+                <input type="text" id="keyword" value="{{ udp_config.keyword }}"
+                       class="input-text">
+                <span class="setting-hint">Key phrase for device filtering (default: Ave_Omnissiah)</span>
+            </div>
+        </div>
+
+        <div class="settings-group">
+            <h3>Device Management</h3>
+            <div class="setting-row">
+                <label for="device_timeout_minutes">Offline Timeout (min):</label>
+                <input type="number" id="device_timeout_minutes"
+                       value="{{ udp_config.device_timeout_minutes }}"
+                       min="1" max="1440" class="input-num">
+                <span class="setting-hint">Minutes without response to mark device offline</span>
+            </div>
+            <div class="setting-row">
+                <label for="device_cleanup_hours">Cleanup Interval (hours):</label>
+                <input type="number" id="device_cleanup_hours"
+                       value="{{ udp_config.device_cleanup_hours }}"
+                       min="1" max="720" class="input-num">
+                <span class="setting-hint">Remove devices not seen for this many hours</span>
+            </div>
+        </div>
+
+        <div class="settings-group">
+            <h3>Traffic Light Settings</h3>
+            <p style="font-size:12px; color:#666; margin:0 0 10px 0;">
+                Preserved for session seamlessness (from AppSettings.cs).
+            </p>
+            <div class="setting-row">
+                <label for="is_minutes_mode">Minutes Mode:</label>
+                <input type="checkbox" id="is_minutes_mode"
+                       {% if traffic_light.is_minutes_mode %}checked{% endif %}>
+                <span class="setting-hint">Use minutes instead of seconds</span>
+            </div>
+            <div class="setting-row">
+                <label for="green_time">Green Time:</label>
+                <input type="number" id="green_time" value="{{ traffic_light.green_time }}"
+                       min="1" max="999" class="input-num">
+            </div>
+            <div class="setting-row">
+                <label for="yellow_time">Yellow Time:</label>
+                <input type="number" id="yellow_time" value="{{ traffic_light.yellow_time }}"
+                       min="1" max="999" class="input-num">
+            </div>
+            <div class="setting-row">
+                <label for="red_time">Red Time:</label>
+                <input type="number" id="red_time" value="{{ traffic_light.red_time }}"
+                       min="1" max="999" class="input-num">
+            </div>
+        </div>
+
+        <div class="settings-actions">
+            <button onclick="saveUdpSettings()" class="button">💾 Save Settings</button>
+            <span id="save-status" style="margin-left:10px; font-size:13px;"></span>
+        </div>
+    </div>
+
+    <!-- Listener Status -->
+    <h2 class="title" style="background: #7D8EE2">Listener Status</h2>
+    <div class="status-grid">
+        <div class="status-card">
+            <div class="label">Status</div>
+            <div class="value" id="listener-status"
+                 style="color: {{ 'green' if listener_running else 'red' }};">
+                {{ 'Running' if listener_running else 'Stopped' }}
+            </div>
+        </div>
+        <div class="status-card">
+            <div class="label">Messages Received</div>
+            <div class="value">{{ msg_count }}</div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <div class="footer">
+            OTA Firmware Server — UDP Settings<br>
+            Configure device discovery and traffic light parameters.
+        </div>
+        <div class="copyright">(c) 2025 OTA Server</div>
+    </footer>
+
+    <script>
+    function saveUdpSettings() {
+        const btn = event.target;
+        const status = document.getElementById('save-status');
+        btn.disabled = true;
+        status.textContent = 'Saving...';
+
+        const data = {
+            udp_listener: {
+                is_listening: document.getElementById('is_listening').checked,
+                receive_port: parseInt(document.getElementById('receive_port').value),
+                transmit_port: parseInt(document.getElementById('transmit_port').value),
+                keyword: document.getElementById('keyword').value,
+                device_timeout_minutes: parseInt(document.getElementById('device_timeout_minutes').value),
+                device_cleanup_hours: parseInt(document.getElementById('device_cleanup_hours').value)
+            },
+            traffic_light: {
+                is_minutes_mode: document.getElementById('is_minutes_mode').checked,
+                green_time: parseInt(document.getElementById('green_time').value),
+                yellow_time: parseInt(document.getElementById('yellow_time').value),
+                red_time: parseInt(document.getElementById('red_time').value)
+            }
+        };
+
+        fetch('/api/udp/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        })
+        .then(r => r.json())
+        .then(result => {
+            if (result.success) {
+                status.innerHTML = '<span style="color:green;">✓ Saved successfully!</span>';
+                setTimeout(() => location.reload(), 1500);
+            } else {
+                status.innerHTML = '<span style="color:red;">Error: ' + (result.error || 'Unknown') + '</span>';
+            }
+        })
+        .catch(err => {
+            status.innerHTML = '<span style="color:red;">Network error: ' + err + '</span>';
+        })
+        .finally(() => {
+            btn.disabled = false;
+        });
+    }
+    </script>
+</body>
+</html>

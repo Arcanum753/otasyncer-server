@@ -1,0 +1,76 @@
+{
+    "columns": [
+        {
+            "field": "status",
+            "visible": true
+        },
+        {
+            "field": "deviceName",
+            "visible": true
+        },
+        {
+            "field": "ip",
+            "visible": true
+        },
+        {
+            "field": "mac",
+            "visible": true
+        },
+        {
+            "field": "target",
+            "visible": true
+        },
+        {
+            "field": "espVer",
+            "visible": true
+        },
+        {
+            "field": "uptime",
+            "visible": true
+        },
+        {
+            "field": "rstreason",
+            "visible": true
+        },
+        {
+            "field": "lastSeen",
+            "visible": true
+        },
+        {
+            "field": "deviceSerial",
+            "visible": true
+        },
+        {
+            "field": "buildtime",
+            "visible": true
+        },
+        {
+            "field": "gitbranch",
+            "visible": true
+        },
+        {
+            "field": "gitcommit",
+            "visible": true
+        },
+        {
+            "field": "webVer",
+            "visible": true
+        },
+        {
+            "field": "udpPortTx",
+            "visible": true
+        },
+        {
+            "field": "udpPortRx",
+            "visible": true
+        },
+        {
+            "field": "udpTimeOut",
+            "visible": true
+        },
+        {
+            "field": "keyword",
+            "visible": true
+        }
+    ]
+}

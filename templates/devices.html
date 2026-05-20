@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OTA Server — Devices</title>
+    <meta http-equiv="Content-type" content="text/html; charset=utf-8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <!-- Header -->
+    <h3 class="top">OTA Server.<sup>&copy;</sup></h3>
+    <div class="menu">
+        <div>
+            <a href="/">Main</a>
+            <a href="/devices" class="active">Devices</a>
+            <a href="/udp-settings">UDP Settings</a>
+        </div>
+    </div>
+
+    <!-- Status Bar -->
+    <h2 class="title" style="background: #7D8EE2">Device Monitor</h2>
+    <div class="status-grid">
+        <div class="status-card">
+            <div class="label">Total Devices</div>
+            <div class="value" id="total-count">{{ device_count }}</div>
+        </div>
+        <div class="status-card">
+            <div class="label">Online</div>
+            <div class="value" id="online-count" style="color: #28a745;">{{ device_online }}</div>
+        </div>
+        <div class="status-card">
+            <div class="label">Offline</div>
+            <div class="value" id="offline-count" style="color: #dc3545;">{{ device_count - device_online }}</div>
+        </div>
+    </div>
+
+    <!-- Filter Bar -->
+    <div class="filter-bar">
+        <label for="time-filter">Show devices seen in last:</label>
+        <select id="time-filter" onchange="loadDevices()">
+            <option value="5">5 minutes</option>
+            <option value="15">15 minutes</option>
+            <option value="60" selected>1 hour</option>
+            <option value="360">6 hours</option>
+            <option value="1440">24 hours</option>
+            <option value="0">All time</option>
+        </select>
+        <button onclick="probeDevices()" class="button" style="margin-left:15px;">🔍 Probe Devices</button>
+        <button onclick="loadDevices()" class="button" style="margin-left:5px;">🔄 Refresh</button>
+        <button onclick="clearDevices()" class="button button-danger" style="margin-left:15px;">🗑 Clear All Devices</button>
+        <span id="probe-status" style="margin-left:10px; font-size:13px; color:#666;"></span>
+    </div>
+
+    <!-- Devices Table -->
+    <div id="devices-container">
+        <p style="text-align:center; color:#666; margin:20px 0;">Loading devices...</p>
+    </div>
+
+    <!-- Event Log -->
+    <h2 class="title" style="background: #7D8EE2">Event Log</h2>
+    <p style="text-align:center; font-size:13px; color:#666; margin-bottom:10px;">
+        Live events from UDP device broadcasts. Updates in real time.
+    </p>
+    <div class="event-log-container" id="event-log-container">
+        <div id="event-log">
+            <div class="event-log-empty">No events yet. Wait for device broadcasts...</div>
+        </div>
+    </div>
+
+    <!-- Display Format Editor -->
+    <h2 class="title" style="background: #7D8EE2">Display Columns</h2>
+    <p style="text-align:center; font-size:13px; color:#666; margin-bottom:10px;">
+        Toggle column visibility. Changes are saved immediately.
+    </p>
+    <div id="columns-editor" class="columns-editor">
+        {% for col in display_format.columns %}
+        <label class="column-toggle">
+            <input type="checkbox" class="col-checkbox"
+                   data-field="{{ col.field }}"
+                   {% if col.visible %}checked{% endif %}
+                   onchange="saveColumnFormat()">
+            {{ col.label }}
+        </label>
+        {% endfor %}
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <div class="footer">
+            OTA Firmware Server — Device Monitor<br>
+            Listening for UDP broadcasts from OTA client devices.
+        </div>
+        <div class="copyright">(c) 2025 OTA Server</div>
+    </footer>
+
+    <script>
+    let autoRefreshInterval = null;
+
+    // ---- Load Devices ----
+    function loadDevices() {
+        const minutes = document.getElementById('time-filter').value;
+        fetch('/api/devices?minutes=' + minutes)
+        .then(r => r.json())
+        .then(data => {
+            renderDevices(data.devices);
+            document.getElementById('total-count').textContent = data.total;
+            document.getElementById('online-count').textContent = data.online;
+            document.getElementById('offline-count').textContent = data.total - data.online;
+        })
+        .catch(err => {
+            document.getElementById('devices-container').innerHTML =
+                '<p style="text-align:center; color:red; margin:20px 0;">Error loading devices: ' + err + '</p>';
+        });
+    }
+
+    // ---- Render Devices Table ----
+    function renderDevices(devices) {
+        const container = document.getElementById('devices-container');
+
+        if (devices.length === 0) {
+            container.innerHTML = '<p style="text-align:center; color:#666; margin:20px 0;">No devices found. Wait for UDP broadcasts or click "Probe Devices".</p>';
+            return;
+        }
+
+        // Get visible columns
+        const checkboxes = document.querySelectorAll('.col-checkbox');
+        const visibleFields = [];
+        checkboxes.forEach(cb => {
+            if (cb.checked) {
+                visibleFields.push(cb.dataset.field);
+            }
+        });
+
+        // Column labels
+        const colLabels = {};
+        {% for col in display_format.columns %}
+        colLabels['{{ col.field }}'] = '{{ col.label }}';
+        {% endfor %}
+
+        let html = '<table class="scan device-table">';
+        html += '<thead><tr>';
+        visibleFields.forEach(field => {
+            html += '<th>' + (colLabels[field] || field) + '</th>';
+        });
+        html += '</tr></thead><tbody>';
+
+        devices.forEach(dev => {
+            html += '<tr>';
+            visibleFields.forEach(field => {
+                let value = '';
+                if (field === 'status') {
+                    value = dev.isOnline
+                        ? '<span class="status-indicator status-online" title="Online">●</span>'
+                        : '<span class="status-indicator status-offline" title="Offline">●</span>';
+                } else if (field === 'lastSeen') {
+                    value = formatTime(dev.lastSeen);
+                } else {
+                    value = dev[field] || '';
+                }
+                html += '<td>' + value + '</td>';
+            });
+            html += '</tr>';
+        });
+
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    }
+
+    // ---- Format Time ----
+    function formatTime(isoStr) {
+        if (!isoStr) return '';
+        try {
+            const d = new Date(isoStr);
+            const now = new Date();
+            const diffMs = now - d;
+            const diffMin = Math.floor(diffMs / 60000);
+
+            if (diffMin < 1) return 'Just now';
+            if (diffMin < 60) return diffMin + ' min ago';
+
+            const diffHours = Math.floor(diffMin / 60);
+            if (diffHours < 24) return diffHours + 'h ago';
+
+            const diffDays = Math.floor(diffHours / 24);
+            return diffDays + 'd ago';
+        } catch(e) {
+            return isoStr;
+        }
+    }
+
+    // ---- Probe Devices ----
+    function probeDevices() {
+        const btn = event.target;
+        const status = document.getElementById('probe-status');
+        btn.disabled = true;
+        status.textContent = 'Sending probe...';
+
+        fetch('/api/udp/probe', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                status.textContent = 'Probe sent (' + data.sent_count + ' packets). Waiting for responses...';
+                setTimeout(() => {
+                    loadDevices();
+                    status.textContent = '';
+                }, 3000);
+            } else {
+                status.textContent = 'Error: ' + (data.error || 'Unknown');
+            }
+        })
+        .catch(err => {
+            status.textContent = 'Network error: ' + err;
+        })
+        .finally(() => {
+            btn.disabled = false;
+        });
+    }
+
+    // ---- Save Column Format ----
+    function saveColumnFormat() {
+        const checkboxes = document.querySelectorAll('.col-checkbox');
+        const columns = [];
+        checkboxes.forEach(cb => {
+            columns.push({
+                field: cb.dataset.field,
+                visible: cb.checked
+            });
+        });
+
+        fetch('/api/display/format', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ columns: columns })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                loadDevices();
+            }
+        })
+        .catch(err => {
+            console.error('Save column format error:', err);
+        });
+    }
+
+    // ---- Auto Refresh ----
+    function startAutoRefresh() {
+        if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+        autoRefreshInterval = setInterval(loadDevices, 30000);
+    }
+
+    // ---- Clear All Devices ----
+    function clearDevices() {
+        if (!confirm('Are you sure you want to clear ALL devices? This cannot be undone.')) {
+            return;
+        }
+        const btn = event.target;
+        btn.disabled = true;
+        btn.textContent = 'Clearing...';
+
+        fetch('/api/devices/clear', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                loadDevices();
+                document.getElementById('event-log').innerHTML =
+                    '<div class="event-log-empty">All devices cleared.</div>';
+            } else {
+                alert('Error: ' + (data.error || 'Unknown'));
+            }
+        })
+        .catch(err => {
+            alert('Network error: ' + err);
+        })
+        .finally(() => {
+            btn.disabled = false;
+            btn.textContent = '🗑 Clear All Devices';
+        });
+    }
+
+    // ---- SSE Event Log ----
+    function setupEventSource() {
+        const eventLog = document.getElementById('event-log');
+        const maxEntries = 100;
+
+        // Сначала загружаем историю лога
+        fetch('/api/events/log')
+        .then(r => r.json())
+        .then(data => {
+            if (data.events && data.events.length > 0) {
+                eventLog.innerHTML = '';
+                data.events.forEach(ev => {
+                    addLogEntry(ev, false);
+                });
+            }
+        })
+        .catch(err => console.error('Failed to load event log history:', err));
+
+        // Подключаемся к SSE
+        const evtSource = new EventSource('/api/events');
+
+        evtSource.onmessage = function(e) {
+            try {
+                const eventData = JSON.parse(e.data);
+                addLogEntry(eventData, true);
+                // При получении события от устройства — обновляем таблицу
+                if (eventData.type === 'device_created' || eventData.type === 'device_updated') {
+                    loadDevices();
+                }
+                // При очистке — тоже обновляем таблицу
+                if (eventData.type === 'devices_cleared') {
+                    loadDevices();
+                }
+            } catch(err) {
+                console.error('SSE parse error:', err);
+            }
+        };
+
+        evtSource.onerror = function(e) {
+            console.error('SSE connection error, will retry automatically:', e);
+        };
+    }
+
+    function addLogEntry(eventData, prepend) {
+        const eventLog = document.getElementById('event-log');
+        const maxEntries = 100;
+
+        // Убираем заглушку "No events yet"
+        const emptyMsg = eventLog.querySelector('.event-log-empty');
+        if (emptyMsg) {
+            emptyMsg.remove();
+        }
+
+        // Форматируем время
+        let timeStr = '';
+        try {
+            const d = new Date(eventData.timestamp);
+            timeStr = d.toLocaleTimeString();
+        } catch(e) {
+            timeStr = '--:--:--';
+        }
+
+        // Определяем CSS-класс по типу события
+        let typeClass = 'event-log-updated';
+        if (eventData.type === 'device_created') {
+            typeClass = 'event-log-created';
+        } else if (eventData.type === 'devices_cleared') {
+            typeClass = 'event-log-cleared';
+        }
+
+        const entry = document.createElement('div');
+        entry.className = 'event-log-entry ' + typeClass;
+        entry.innerHTML = '<span class="event-log-time">' + timeStr + '</span>' +
+                          '<span class="event-log-message">' + escapeHtml(eventData.message || '') + '</span>';
+
+        if (prepend) {
+            eventLog.insertBefore(entry, eventLog.firstChild);
+        } else {
+            eventLog.appendChild(entry);
+        }
+
+        // Ограничиваем количество записей
+        while (eventLog.children.length > maxEntries) {
+            eventLog.removeChild(eventLog.lastChild);
+        }
+    }
+
+    function escapeHtml(text) {
+        if (!text) return '';
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // ---- Init ----
+    document.addEventListener('DOMContentLoaded', function() {
+        loadDevices();
+        startAutoRefresh();
+        setupEventSource();
+    });
+    </script>
+</body>
+</html>
