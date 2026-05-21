@@ -67,20 +67,25 @@
     </div>
 
     <!-- Display Format Editor -->
-    <h2 class="title" style="background: #7D8EE2">Display Columns</h2>
-    <p style="text-align:center; font-size:13px; color:#666; margin-bottom:10px;">
-        Toggle column visibility. Changes are saved immediately.
-    </p>
+    <h2 class="title" style="background: #7D8EE2">
+        Display Columns
+        <button onclick="toggleColumns()" id="columns-toggle-btn" class="collapse-btn" title="Hide/show columns list">▲</button>
+    </h2>
     <div id="columns-editor" class="columns-editor">
-        {% for col in display_format.columns %}
-        <label class="column-toggle">
-            <input type="checkbox" class="col-checkbox"
-                   data-field="{{ col.field }}"
-                   {% if col.visible %}checked{% endif %}
-                   onchange="saveColumnFormat()">
-            {{ col.label }}
-        </label>
-        {% endfor %}
+        <p style="text-align:center; font-size:13px; color:#666; margin-bottom:10px;">
+            Toggle column visibility. Changes are saved immediately.
+        </p>
+        <div id="columns-list" class="columns-list">
+            {% for col in display_format.columns %}
+            <label class="column-toggle">
+                <input type="checkbox" class="col-checkbox"
+                       data-field="{{ col.field }}"
+                       {% if col.visible %}checked{% endif %}
+                       onchange="saveColumnFormat()">
+                <span class="col-label">{{ col.label }}</span>
+            </label>
+            {% endfor %}
+        </div>
     </div>
 
     <!-- Footer -->
@@ -136,7 +141,8 @@
         colLabels['{{ col.field }}'] = '{{ col.label }}';
         {% endfor %}
 
-        let html = '<table class="scan device-table">';
+        let html = '<div class="devices-table-wrapper">';
+        html += '<table class="scan device-table">';
         html += '<thead><tr>';
         visibleFields.forEach(field => {
             html += '<th>' + (colLabels[field] || field) + '</th>';
@@ -162,6 +168,7 @@
         });
 
         html += '</tbody></table>';
+        html += '</div>';
         container.innerHTML = html;
     }
 
@@ -369,6 +376,17 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // ---- Toggle Columns Visibility ----
+    function toggleColumns() {
+        const list = document.getElementById('columns-list');
+        const btn = document.getElementById('columns-toggle-btn');
+        if (!list || !btn) return;
+        const isHidden = list.style.display === 'none';
+        list.style.display = isHidden ? 'flex' : 'none';
+        btn.textContent = isHidden ? '▲' : '▼';
+        btn.title = isHidden ? 'Hide columns list' : 'Show columns list';
     }
 
     // ---- Init ----

@@ -752,10 +752,22 @@ def calculate_md5(filepath):
 
 
 def get_file_type(filename):
-    """Determine file type from filename: 'firmware' or 'filesystem'."""
-    if "_fs-" in filename:
+    """Determine file type from filename: 'firmware' or 'filesystem'.
+    
+    New format:
+        Test32Ota-FIRMWARE-0.021.20260521_2135.0711.bin  -> firmware
+        Test32Ota-FILESYS-0.021.20260521_2135.0711.bin   -> filesystem
+    
+    Old format (no longer generated, but ignored gracefully):
+        Test32Ota-0.021.20260521_2135.0711.bin            -> unknown
+        Test32Ota_fs-0.021.20260521_2135.0711.bin         -> unknown
+    """
+    if "-FILESYS-" in filename:
         return "filesystem"
-    return "firmware"
+    elif "-FIRMWARE-" in filename:
+        return "firmware"
+    else:
+        return "unknown"
 
 
 def scan_firmware_files():
@@ -871,6 +883,8 @@ def manifest():
     entries = scan_firmware_files()
     clean = []
     for e in entries:
+        if e["type"] == "unknown":
+            continue
         clean.append({
             "name": e["name"],
             "type": e["type"],
