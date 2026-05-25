@@ -55,24 +55,29 @@
         Add or remove directories where the server looks for .bin files.
     </p>
     <div id="dirs-list">
-        {% for dir in firmware_dirs %}
+        {% for entry in firmware_dirs %}
         <div class="dir-item">
-            <input type="text" value="{{ dir }}" class="dir-path" id="dir-path-{{ loop.index0 }}">
+            <input type="text" value="{{ entry.path }}" class="dir-path" id="dir-path-{{ loop.index0 }}">
             <button onclick="browseFolder({{ loop.index0 }}, this)" class="button" style="font-size:12px; padding:2px 10px;">Browse...</button>
+            <label class="dir-delete-old-label" title="When a new firmware file appears, automatically delete older versions of the same firmware type">
+                <input type="checkbox" class="dir-delete-old" data-index="{{ loop.index0 }}"
+                       {% if entry.delete_old_versions %}checked{% endif %}>
+                🗑 удалять старые версии
+            </label>
             <button onclick="removeDir(this)" class="button-remove">Remove</button>
         </div>
         {% endfor %}
     </div>
     <div class="dir-actions">
         <button onclick="addDir()" class="button">+ Add Directory</button>
-        <button onclick="saveDirs()" class="button">Save Directories</button>
+        <button onclick="saveDirs()" class="button">Save Options</button>
     </div>
     <div id="dirs-message"></div>
 
     <!-- Upload Form -->
     <h2 class="title" style="background: #7D8EE2">Upload New Firmware</h2>
     <p style="text-align:center; font-size:13px; color:#666; margin-bottom:10px;">
-        Uploads to: <strong>{{ firmware_dirs[0] if firmware_dirs else './firmware' }}</strong>
+        Uploads to: <strong>{{ firmware_dirs[0].path if firmware_dirs else './firmware' }}</strong>
     </p>
     <form method="POST" action="{{ url_for('upload_firmware') }}" enctype="multipart/form-data" class="upload-form">
         <input type="file" name="file" id="file" required>
@@ -187,6 +192,10 @@
         div.innerHTML = `
             <input type="text" value="./firmware" class="dir-path" id="dir-path-${idx}">
             <button onclick="browseFolder(${idx}, this)" class="button" style="font-size:12px; padding:2px 10px;">Browse...</button>
+            <label class="dir-delete-old-label" title="When a new firmware file appears, automatically delete older versions of the same firmware type">
+                <input type="checkbox" class="dir-delete-old" data-index="${idx}">
+                🗑 удалять старые версии
+            </label>
             <button onclick="removeDir(this)" class="button-remove">Remove</button>
         `;
         list.appendChild(div);
@@ -203,11 +212,18 @@
     }
 
     function saveDirs() {
-        const inputs = document.querySelectorAll('.dir-path');
+        const items = document.querySelectorAll('.dir-item');
         const dirs = [];
-        inputs.forEach(inp => {
-            const val = inp.value.trim();
-            if (val) dirs.push(val);
+        items.forEach(item => {
+            const pathInput = item.querySelector('.dir-path');
+            const deleteCheck = item.querySelector('.dir-delete-old');
+            const path = pathInput.value.trim();
+            if (path) {
+                dirs.push({
+                    path: path,
+                    delete_old_versions: deleteCheck ? deleteCheck.checked : false
+                });
+            }
         });
 
         if (dirs.length === 0) {
@@ -223,7 +239,7 @@
         .then(r => r.json())
         .then(data => {
             if (data.success) {
-                document.getElementById('dirs-message').innerHTML = '<span style="color:green;">Directories saved! Reloading...</span>';
+                document.getElementById('dirs-message').innerHTML = '<span style="color:green;">Options saved! Reloading...</span>';
                 setTimeout(() => location.reload(), 1000);
             } else {
                 document.getElementById('dirs-message').innerHTML = '<span style="color:red;">Error: ' + (data.error || 'Unknown') + '</span>';

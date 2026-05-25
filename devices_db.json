@@ -1,0 +1,46 @@
+{
+    "devices": [
+        {
+            "mac": "08:3A:F2:AB:BD:54",
+            "deviceName": "esp",
+            "deviceSerial": "000",
+            "ip": "192.168.88.159",
+            "target": "Test32Ota",
+            "uptime": "   0 days 00:05:15",
+            "rstreason": "Software reset",
+            "espVer": "0.022.20260525_1209.0744",
+            "webVer": "1.10.30",
+            "buildtime": "2026-05-25 12:09:03",
+            "gitbranch": "oservice-ota-client",
+            "gitcommit": "82f8953",
+            "udpPortTx": 40000,
+            "udpPortRx": 40001,
+            "udpTimeOut": 5,
+            "keyword": "Ave_Omnissiah",
+            "lastSeen": "2026-05-25T09:20:35.511780+00:00",
+            "firstSeen": "2026-05-19T21:33:45.064368+00:00",
+            "isOnline": false
+        },
+        {
+            "mac": "D8:F1:5B:07:0F:80",
+            "deviceName": "esp",
+            "deviceSerial": "000",
+            "ip": "192.168.88.158",
+            "target": "Test8266Ota",
+            "uptime": "   0 days 00:00:07",
+            "rstreason": "Software restart",
+            "espVer": "0.022.20260525_1224.0749",
+            "webVer": "1.10.30",
+            "buildtime": "2026-05-25 12:24:36",
+            "gitbranch": "oservice-ota-client",
+            "gitcommit": "82f8953",
+            "udpPortTx": 40000,
+            "udpPortRx": 40001,
+            "udpTimeOut": 5,
+            "keyword": "Ave_Omnissiah",
+            "lastSeen": "2026-05-25T14:30:11.406940+00:00",
+            "firstSeen": "2026-05-25T09:24:56.304604+00:00",
+            "isOnline": false
+        }
+    ]
+}

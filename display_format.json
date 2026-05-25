@@ -2,74 +2,92 @@
     "columns": [
         {
             "field": "status",
+            "label": "Status",
             "visible": true
         },
         {
             "field": "deviceName",
+            "label": "Device Name",
             "visible": true
         },
         {
             "field": "ip",
+            "label": "IP Address",
             "visible": true
         },
         {
             "field": "mac",
+            "label": "MAC Address",
             "visible": true
         },
         {
             "field": "target",
+            "label": "Platform",
             "visible": true
         },
         {
             "field": "espVer",
+            "label": "FW Version",
             "visible": true
         },
         {
             "field": "uptime",
+            "label": "Uptime",
             "visible": true
         },
         {
             "field": "rstreason",
+            "label": "Reset Reason",
             "visible": true
         },
         {
             "field": "lastSeen",
+            "label": "Last Seen",
             "visible": true
         },
         {
             "field": "deviceSerial",
+            "label": "Serial",
             "visible": true
         },
         {
             "field": "buildtime",
+            "label": "Build Time",
             "visible": true
         },
         {
             "field": "gitbranch",
+            "label": "Git Branch",
             "visible": true
         },
         {
             "field": "gitcommit",
+            "label": "Git Commit",
             "visible": true
         },
         {
             "field": "webVer",
+            "label": "Web Version",
             "visible": true
         },
         {
             "field": "udpPortTx",
+            "label": "UDP TX Port",
             "visible": true
         },
         {
             "field": "udpPortRx",
+            "label": "UDP RX Port",
             "visible": true
         },
         {
             "field": "udpTimeOut",
+            "label": "UDP Timeout",
             "visible": true
         },
         {
             "field": "keyword",
+            "label": "Keyword",
             "visible": true
         }
     ]

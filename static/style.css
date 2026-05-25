@@ -335,6 +335,32 @@ iframe {
     background-color: #f5c6cb;
 }
 
+/* Delete old versions checkbox in dir editor */
+.dir-delete-old-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: #555;
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: #fff;
+    border: 1px solid #d6d9da;
+    transition: background 0.15s;
+}
+.dir-delete-old-label:hover {
+    background: #eef;
+}
+.dir-delete-old-label input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    margin: 0;
+}
+
 /* Dir editor buttons area */
 .dir-actions {
     margin: 8px 0;

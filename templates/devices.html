@@ -227,8 +227,10 @@
         const checkboxes = document.querySelectorAll('.col-checkbox');
         const columns = [];
         checkboxes.forEach(cb => {
+            const labelEl = cb.parentElement.querySelector('.col-label');
             columns.push({
                 field: cb.dataset.field,
+                label: labelEl ? labelEl.textContent : cb.dataset.field,
                 visible: cb.checked
             });
         });

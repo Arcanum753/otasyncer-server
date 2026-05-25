@@ -40,7 +40,7 @@ MAX_EVENT_LOG_SIZE = 200
 DEFAULT_CONFIG = {
     "host": "0.0.0.0",
     "port": 8080,
-    "firmware_dirs": ["./firmware"],
+    "firmware_dirs": [{"path": "./firmware", "delete_old_versions": False}],
     "manifest_path": "/manifest.json",
     "udp_listener": {
         "is_listening": True,
@@ -384,6 +384,28 @@ class DeviceStorage:
 
 
 # ============================================================
+# Вспомогательные функции для конфигурации
+# ============================================================
+def normalize_firmware_dirs(dirs):
+    """
+    Normalize firmware_dirs config to list of dicts.
+    Supports backward compatibility with old format (list of strings).
+    """
+    normalized = []
+    for entry in dirs:
+        if isinstance(entry, str):
+            normalized.append({"path": entry, "delete_old_versions": False})
+        elif isinstance(entry, dict):
+            normalized.append({
+                "path": entry.get("path", "./firmware"),
+                "delete_old_versions": entry.get("delete_old_versions", False)
+            })
+        else:
+            normalized.append({"path": "./firmware", "delete_old_versions": False})
+    return normalized
+
+
+# ============================================================
 # Загрузка/сохранение конфигурации
 # ============================================================
 def load_config():
@@ -403,9 +425,10 @@ def load_config():
                     for k, v in dflt.items():
                         if k not in merged[section]:
                             merged[section][k] = v
-            # Ensure firmware_dirs is a list
+            # Ensure firmware_dirs is a list and normalize to dict format
             if not isinstance(merged["firmware_dirs"], list):
                 merged["firmware_dirs"] = [merged["firmware_dirs"]]
+            merged["firmware_dirs"] = normalize_firmware_dirs(merged["firmware_dirs"])
             return merged
         except Exception as e:
             print(f"Error loading config: {e}")
@@ -415,10 +438,14 @@ def load_config():
 
 def save_config(cfg):
     """Сохранить конфигурацию в файл."""
+    # Normalize firmware_dirs to dict format before saving
+    raw_dirs = cfg.get("firmware_dirs", DEFAULT_CONFIG["firmware_dirs"])
+    normalized_dirs = normalize_firmware_dirs(raw_dirs)
+    
     to_save = {
         "host": cfg.get("host", DEFAULT_CONFIG["host"]),
         "port": cfg.get("port", DEFAULT_CONFIG["port"]),
-        "firmware_dirs": cfg.get("firmware_dirs", DEFAULT_CONFIG["firmware_dirs"]),
+        "firmware_dirs": normalized_dirs,
         "manifest_path": cfg.get("manifest_path", DEFAULT_CONFIG["manifest_path"]),
         "udp_listener": cfg.get("udp_listener", DEFAULT_CONFIG["udp_listener"]),
         "traffic_light": cfg.get("traffic_light", DEFAULT_CONFIG["traffic_light"])
@@ -712,8 +739,9 @@ if udp_cfg.get("is_listening", True):
     udp_listener.start(udp_cfg.get("receive_port", 40000))
 
 # Ensure all firmware dirs exist
-for d in config["firmware_dirs"]:
-    os.makedirs(d, exist_ok=True)
+for entry in config["firmware_dirs"]:
+    dir_path = entry["path"] if isinstance(entry, dict) else entry
+    os.makedirs(dir_path, exist_ok=True)
 
 
 # ============================================================
@@ -773,7 +801,8 @@ def get_file_type(filename):
 def scan_firmware_files():
     """Scan all firmware directories and return list of file entries."""
     entries = []
-    for dir_path in config["firmware_dirs"]:
+    for entry in config["firmware_dirs"]:
+        dir_path = entry["path"] if isinstance(entry, dict) else entry
         if not os.path.exists(dir_path):
             continue
         for fname in os.listdir(dir_path):
@@ -812,11 +841,152 @@ def get_file_status():
 def find_file_in_dirs(filename):
     """Search for a file across all firmware dirs, return full path or None."""
     safe_name = secure_filename(filename)
-    for dir_path in config["firmware_dirs"]:
+    for entry in config["firmware_dirs"]:
+        dir_path = entry["path"] if isinstance(entry, dict) else entry
         candidate = os.path.join(dir_path, safe_name)
         if os.path.exists(candidate):
             return candidate
     return None
+
+
+def parse_firmware_filename(filename):
+    """
+    Parse a firmware filename and extract components.
+    
+    Format: {env_name}-{TYPE}-{MAJOR}.{MINOR}.{DATE}_{TIME}.{BUILD}.bin
+    
+    Returns dict with keys: prefix (env_name-TYPE), version_str, or None if unparseable.
+    """
+    import re
+    # Pattern: <env_name>-FIRMWARE-<version>.bin or <env_name>-FILESYS-<version>.bin
+    match = re.match(r'^(.+-(?:FIRMWARE|FILESYS))-(\d+\.\d+\.\d+_\d+\.\d+)\.bin$', filename)
+    if match:
+        return {
+            "prefix": match.group(1),
+            "version_str": match.group(2)
+        }
+    return None
+
+
+def version_to_sort_key(version_str):
+    """
+    Convert version string '0.022.20260525_1209.0744' to a tuple for comparison.
+    Higher tuple = newer version.
+    """
+    try:
+        parts = version_str.split('.')
+        major = int(parts[0])
+        minor = int(parts[1])
+        # date_time part: '20260525_1209' -> remove underscore for numeric compare
+        date_part = parts[2].replace('_', '')
+        date_val = int(date_part)
+        build = int(parts[3])
+        return (major, minor, date_val, build)
+    except (IndexError, ValueError):
+        return None
+
+
+def remove_old_versions(filepath):
+    """
+    When a new firmware file appears, remove older versions of the same
+    firmware type (same env_name + FIRMWARE/FILESYS prefix) from the same directory.
+    
+    Only works if the filename follows the standard format:
+        {env_name}-{TYPE}-{MAJOR}.{MINOR}.{DATE}_{TIME}.{BUILD}.bin
+    
+    Returns list of removed file paths.
+    """
+    dir_path = os.path.dirname(filepath)
+    filename = os.path.basename(filepath)
+    
+    parsed = parse_firmware_filename(filename)
+    if not parsed:
+        return []
+    
+    prefix = parsed["prefix"]
+    new_version_key = version_to_sort_key(parsed["version_str"])
+    if new_version_key is None:
+        return []
+    
+    removed = []
+    for fname in os.listdir(dir_path):
+        if fname == filename:
+            continue
+        if not fname.endswith('.bin'):
+            continue
+        
+        other_parsed = parse_firmware_filename(fname)
+        if not other_parsed:
+            continue
+        
+        # Same prefix (same env_name + type) -> candidate for removal
+        if other_parsed["prefix"] != prefix:
+            continue
+        
+        other_version_key = version_to_sort_key(other_parsed["version_str"])
+        if other_version_key is None:
+            continue
+        
+        # If the other file is older (smaller version key), delete it
+        if other_version_key < new_version_key:
+            other_path = os.path.join(dir_path, fname)
+            try:
+                os.remove(other_path)
+                removed.append(other_path)
+                print(f"Removed old version: {other_path}")
+            except Exception as e:
+                print(f"Error removing old version {other_path}: {e}")
+    
+    return removed
+
+
+def cleanup_dir_old_versions(dir_path):
+    """
+    Scan a directory and remove older versions of firmware files,
+    keeping only the newest version for each (env_name + TYPE) prefix.
+    
+    Returns dict with prefix -> list of removed file paths.
+    """
+    if not os.path.isdir(dir_path):
+        return {}
+    
+    # Group files by prefix
+    groups = {}  # prefix -> [(filename, version_key), ...]
+    for fname in os.listdir(dir_path):
+        if not fname.endswith('.bin'):
+            continue
+        parsed = parse_firmware_filename(fname)
+        if not parsed:
+            continue
+        vkey = version_to_sort_key(parsed["version_str"])
+        if vkey is None:
+            continue
+        prefix = parsed["prefix"]
+        if prefix not in groups:
+            groups[prefix] = []
+        groups[prefix].append((fname, vkey))
+    
+    # For each group, keep only the newest, remove the rest
+    results = {}
+    for prefix, files in groups.items():
+        if len(files) <= 1:
+            continue
+        # Sort by version key descending, keep first (newest)
+        files.sort(key=lambda x: x[1], reverse=True)
+        newest = files[0][0]
+        removed = []
+        for fname, _ in files[1:]:
+            fpath = os.path.join(dir_path, fname)
+            try:
+                os.remove(fpath)
+                removed.append(fpath)
+                print(f"Cleanup removed old version: {fpath}")
+            except Exception as e:
+                print(f"Error removing {fpath}: {e}")
+        if removed:
+            results[prefix] = removed
+    
+    return results
 
 
 # ============================================================
@@ -851,14 +1021,27 @@ def upload_firmware():
         if not filename.endswith('.bin'):
             return redirect(url_for('index', message='Error: Only .bin files are allowed.'))
 
-        target_dir = config["firmware_dirs"][0] if config["firmware_dirs"] else "./firmware"
+        first_entry = config["firmware_dirs"][0] if config["firmware_dirs"] else {"path": "./firmware", "delete_old_versions": False}
+        target_dir = first_entry["path"] if isinstance(first_entry, dict) else first_entry
+        delete_old = first_entry.get("delete_old_versions", False) if isinstance(first_entry, dict) else False
+
         os.makedirs(target_dir, exist_ok=True)
         filepath = os.path.join(target_dir, filename)
         try:
             file.save(filepath)
             md5 = calculate_md5(filepath)
-            return redirect(url_for('index',
-                message=f"Success! Uploaded '{filename}' to {target_dir} (MD5: {md5})"))
+
+            # Remove old versions if enabled for this directory
+            removed_count = 0
+            if delete_old:
+                removed = remove_old_versions(filepath)
+                removed_count = len(removed)
+
+            msg = f"Success! Uploaded '{filename}' to {target_dir} (MD5: {md5})"
+            if removed_count > 0:
+                msg += f" | Removed {removed_count} old version(s)"
+
+            return redirect(url_for('index', message=msg))
         except Exception as e:
             return redirect(url_for('index', message=f"Upload Failed: {str(e)}"))
 
@@ -938,13 +1121,29 @@ def update_dirs():
         if not isinstance(new_dirs, list) or len(new_dirs) == 0:
             return jsonify({"success": False, "error": "firmware_dirs must be a non-empty list"}), 400
 
-        for d in new_dirs:
-            os.makedirs(d, exist_ok=True)
+        # Normalize to dict format (support both old string format and new dict format)
+        normalized = normalize_firmware_dirs(new_dirs)
 
-        config["firmware_dirs"] = new_dirs
+        # Ensure all directories exist
+        for entry in normalized:
+            os.makedirs(entry["path"], exist_ok=True)
+
+        config["firmware_dirs"] = normalized
         save_config(config)
 
-        return jsonify({"success": True, "firmware_dirs": config["firmware_dirs"]})
+        # Run cleanup for directories with delete_old_versions enabled
+        cleanup_results = {}
+        for entry in normalized:
+            if entry.get("delete_old_versions", False):
+                result = cleanup_dir_old_versions(entry["path"])
+                if result:
+                    cleanup_results[entry["path"]] = result
+
+        return jsonify({
+            "success": True,
+            "firmware_dirs": config["firmware_dirs"],
+            "cleanup_results": cleanup_results
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -1137,6 +1336,13 @@ def api_display_format_set():
         data = request.get_json(force=True)
         if not data or "columns" not in data:
             return jsonify({"success": False, "error": "Missing columns"}), 400
+
+        # Восстанавливаем label, если он отсутствует (из DEFAULT_DISPLAY_FORMAT)
+        default_labels = {col['field']: col['label'] for col in DEFAULT_DISPLAY_FORMAT['columns']}
+        for col in data.get('columns', []):
+            if 'label' not in col or not col['label']:
+                col['label'] = default_labels.get(col['field'], col['field'])
+
         if save_display_format(data):
             return jsonify({"success": True})
         return jsonify({"success": False, "error": "Save failed"}), 500
