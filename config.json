@@ -8,7 +8,7 @@
         },
         {
             "path": "D:\\github\\avr-fota\\proj_fwbins",
-            "delete_old_versions": false
+            "delete_old_versions": true
         }
     ],
     "manifest_path": "/manifest.json",

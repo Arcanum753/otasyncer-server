@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import hashlib
+import logging
 import threading
 import socket
 import struct
@@ -42,6 +43,9 @@ DEFAULT_CONFIG = {
     "port": 8080,
     "firmware_dirs": [{"path": "./firmware", "delete_old_versions": False}],
     "manifest_path": "/manifest.json",
+    "manifest": {
+        "entries_per_type": 2
+    },
     "udp_listener": {
         "is_listening": True,
         "receive_port": 40000,
@@ -85,6 +89,32 @@ DEFAULT_DISPLAY_FORMAT = {
 # Flask приложение
 # ============================================================
 app = Flask(__name__)
+
+# ============================================================
+# Фильтр логов Werkzeug — убираем TLS-мусор из консоли
+# ============================================================
+class _WerkzeugLogFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if "Bad request version" in msg or "Bad HTTP/0.9" in msg:
+            return False
+        return True
+
+logging.getLogger("werkzeug").addFilter(_WerkzeugLogFilter())
+
+
+# ============================================================
+# Кастомный обработчик ошибок — понятное сообщение вместо 400
+# ============================================================
+@app.errorhandler(400)
+def _bad_request(error):
+    ip = request.remote_addr or 'unknown'
+    msg = str(error)
+    if "Bad request version" in msg or "Bad HTTP/0.9" in msg:
+        print(f"[WARN] TLS/HTTPS request from {ip} — браузер пытается открыть HTTPS вместо HTTP")
+        return "<html><body><h2>HTTPS не поддерживается</h2><p>Используйте <b>http://</b>, а не https://</p></body></html>", 400
+    return error, 400
+
 
 # ============================================================
 # Модель данных устройства (аналог fota_dev_info из jsonclasses.cs)
@@ -417,7 +447,7 @@ def load_config():
             merged = DEFAULT_CONFIG.copy()
             merged.update(cfg)
             # Убедимся, что вложенные секции есть
-            for section in ['udp_listener', 'traffic_light']:
+            for section in ['udp_listener', 'traffic_light', 'manifest']:
                 if section not in merged:
                     merged[section] = DEFAULT_CONFIG[section].copy()
                 else:
@@ -1062,19 +1092,71 @@ def delete_firmware(filename):
 
 @app.route('/manifest.json')
 def manifest():
-    """Generate manifest.json for OTA client devices."""
+    """Generate manifest.json for OTA client devices.
+
+    Query parameters:
+      target (str)  — BUILD_ENV устройства (обязательный)
+      ver (str)     — текущая версия прошивки устройства (опционально, для лога)
+
+    Returns:
+      files (list)     — entries_per_type новейших файлов для каждого типа
+                         (FIRMWARE + FILESYS), отсортированные от новых к старым
+      has_files (bool) — true если файлы для этого target найдены
+    """
+    target = request.args.get('target', '')
+    entries_per_type = config.get('manifest', {}).get('entries_per_type', 2)
+    entries_per_type = max(1, min(5, entries_per_type))
+
+    if not target:
+        return jsonify({"files": [], "has_files": False})
+
     entries = scan_firmware_files()
-    clean = []
+
+    # Separate by type and assign sort keys
+    firmware = []
+    filesys = []
+
     for e in entries:
         if e["type"] == "unknown":
             continue
-        clean.append({
+        if not e["name"].startswith(target):
+            continue
+
+        parsed = parse_firmware_filename(e["name"])
+        if parsed:
+            vkey = version_to_sort_key(parsed["version_str"])
+            sort_key = vkey if vkey else (0, 0, 0, 0)
+        else:
+            sort_key = (0, 0, 0, 0)
+
+        entry = {
             "name": e["name"],
             "type": e["type"],
             "size": e["size"],
-            "md5": e["md5"]
-        })
-    return jsonify({"files": clean})
+            "md5": e["md5"],
+            "_sort_key": sort_key
+        }
+
+        if e["type"] == "firmware":
+            firmware.append(entry)
+        elif e["type"] == "filesystem":
+            filesys.append(entry)
+
+    # Sort newest first
+    firmware.sort(key=lambda x: x["_sort_key"], reverse=True)
+    filesys.sort(key=lambda x: x["_sort_key"], reverse=True)
+
+    # Take N newest of each type, strip internal sort key
+    def strip_key(entry):
+        return {"name": entry["name"], "type": entry["type"],
+                "size": entry["size"], "md5": entry["md5"]}
+
+    result = [strip_key(e) for e in (firmware[:entries_per_type] + filesys[:entries_per_type])]
+
+    return jsonify({
+        "files": result,
+        "has_files": len(result) > 0
+    })
 
 
 @app.route('/firmware/<path:filename>')

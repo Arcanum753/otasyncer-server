@@ -159,6 +159,8 @@
                         : '<span class="status-indicator status-offline" title="Offline">●</span>';
                 } else if (field === 'lastSeen') {
                     value = formatTime(dev.lastSeen);
+                } else if (field === 'ip' && dev.ip) {
+                    value = '<a href="http://' + dev.ip + '" target="_blank" rel="noopener noreferrer">' + dev.ip + '</a>';
                 } else {
                     value = dev[field] || '';
                 }

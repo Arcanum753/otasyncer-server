@@ -18,7 +18,7 @@
         {
             "field": "mac",
             "label": "MAC Address",
-            "visible": true
+            "visible": false
         },
         {
             "field": "target",
@@ -48,7 +48,7 @@
         {
             "field": "deviceSerial",
             "label": "Serial",
-            "visible": true
+            "visible": false
         },
         {
             "field": "buildtime",
@@ -58,7 +58,7 @@
         {
             "field": "gitbranch",
             "label": "Git Branch",
-            "visible": true
+            "visible": false
         },
         {
             "field": "gitcommit",
@@ -68,27 +68,27 @@
         {
             "field": "webVer",
             "label": "Web Version",
-            "visible": true
+            "visible": false
         },
         {
             "field": "udpPortTx",
             "label": "UDP TX Port",
-            "visible": true
+            "visible": false
         },
         {
             "field": "udpPortRx",
             "label": "UDP RX Port",
-            "visible": true
+            "visible": false
         },
         {
             "field": "udpTimeOut",
             "label": "UDP Timeout",
-            "visible": true
+            "visible": false
         },
         {
             "field": "keyword",
             "label": "Keyword",
-            "visible": true
+            "visible": false
         }
     ]
 }
