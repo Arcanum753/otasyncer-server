@@ -749,6 +749,11 @@ class UdpListener:
             except:
                 continue
 
+        # Если ни один интерфейс не отправил (нет broadcast-адресов) — пробуем глобальный broadcast
+        if sent_count == 0:
+            self.udp_tx_simple_broadcast(message, port)
+            sent_count += 1
+
         print(f"Super broadcast: sent {sent_count} packets on port {port}")
         return sent_count
 
@@ -1398,6 +1403,7 @@ def api_udp_probe():
     # Отправляем keyword как probe-запрос
     # Устройства в udpResponseHandler() проверяют keyword и отвечают
     count = udp_listener.udp_tx_super_broadcast(keyword, port)
+    print(f"Probe: keyword='{keyword}' port={port} sent={count}")
     return jsonify({"success": True, "sent_count": count})
 
 

@@ -48,7 +48,7 @@
         {
             "field": "deviceSerial",
             "label": "Serial",
-            "visible": false
+            "visible": true
         },
         {
             "field": "buildtime",
@@ -63,7 +63,7 @@
         {
             "field": "gitcommit",
             "label": "Git Commit",
-            "visible": true
+            "visible": false
         },
         {
             "field": "webVer",
