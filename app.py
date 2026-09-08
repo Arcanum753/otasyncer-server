@@ -50,7 +50,8 @@ DEFAULT_CONFIG = {
         "transmit_port": 40001,
         "keyword": "Ave_Omnissiah",
         "device_timeout_minutes": 10,
-        "device_cleanup_hours": 24
+        "device_cleanup_hours": 24,
+        "probe_devices_on_startup": True
     },
     "traffic_light": {
         "is_minutes_mode": True,
@@ -702,6 +703,19 @@ class UdpListener:
         # Обновляем устройство в хранилище
         dev, is_new = self._storage.update_device(payload)
 
+        if dev:
+            # Отвечаем устройству ACK (unicast на его udpPortRx из payload),
+            # чтобы устройство запомнило IP сервера и перестало бродкастить.
+            try:
+                ack_msg = json.dumps({"keyword": expected_keyword, "ack": True})
+                ack_port = int(payload.get("udpPortRx", 0) or 0)
+                if not (1024 <= ack_port <= 65535):
+                    ack_port = addr[1]
+                self.udp_tx_unicast(ack_msg, addr[0], ack_port)
+                print(f"UDP Listener: ACK -> {addr[0]}:{ack_port}")
+            except Exception as e:
+                print(f"UDP Listener: ACK error: {e}")
+
         # Формируем событие для SSE и лога
         if dev:
             device_name = dev.deviceName or "Unknown"
@@ -745,6 +759,22 @@ class UdpListener:
             sock.close()
         except Exception as e:
             print(f"UDP simple broadcast error: {e}")
+
+    # ---- Unicast-отправка (аналог ACK устройству) ----
+
+    def udp_tx_unicast(self, message: str, ip: str, port: int):
+        """
+        Отправить unicast-сообщение конкретному устройству.
+        Используется для ACK в ответ на телеметрию устройства.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(2.0)
+            data = message.encode('utf-8')
+            sock.sendto(data, (ip, port))
+            sock.close()
+        except Exception as e:
+            print(f"UDP unicast error: {e}")
 
     # ---- Super-broadcast (аналог udpTxSuperBroadcast) ----
 
@@ -818,6 +848,35 @@ udp_listener = UdpListener(device_storage, sse_mgr=sse_manager, event_log=event_
 udp_cfg = config.get("udp_listener", {})
 if udp_cfg.get("is_listening", True):
     udp_listener.start(udp_cfg.get("receive_port", 40000))
+
+
+def _startup_probe_worker():
+    """
+    Фоновый поток: при старте сервера шлёт 2-3 probe-бродкаста,
+    чтобы устройства услышали сервер, ответили и запомнили его IP
+    (настройка probe_devices_on_startup, по умолчанию включена).
+    """
+    try:
+        if not config.get("udp_listener", {}).get("probe_devices_on_startup", True):
+            return
+        keyword = config.get("udp_listener", {}).get("keyword", "Ave_Omnissiah")
+        port = config.get("udp_listener", {}).get("transmit_port", 40001)
+        time.sleep(2)  # дать сокету привязаться
+        for i in range(3):
+            if not udp_listener.is_running:
+                break
+            count = udp_listener.udp_tx_super_broadcast(keyword, port)
+            print(f"Startup probe {i + 1}/3: keyword='{keyword}' port={port} sent={count}")
+            time.sleep(2)
+    except Exception as e:
+        print(f"Startup probe error: {e}")
+
+
+if config.get("udp_listener", {}).get("probe_devices_on_startup", True):
+    startup_probe_thread = threading.Thread(
+        target=_startup_probe_worker, daemon=True, name="udp-startup-probe"
+    )
+    startup_probe_thread.start()
 
 # Ensure all firmware dirs exist
 for entry in config["firmware_dirs"]:

@@ -50,6 +50,12 @@
                        class="input-text">
                 <span class="setting-hint">Key phrase for device filtering (default: Ave_Omnissiah)</span>
             </div>
+            <div class="setting-row">
+                <label for="probe_devices_on_startup">Probe Devices on Startup:</label>
+                <input type="checkbox" id="probe_devices_on_startup"
+                       {% if udp_config.probe_devices_on_startup %}checked{% endif %}>
+                <span class="setting-hint">Broadcast keyword probe to devices right after server start</span>
+            </div>
         </div>
 
         <div class="settings-group">
@@ -142,6 +148,7 @@
                 receive_port: parseInt(document.getElementById('receive_port').value),
                 transmit_port: parseInt(document.getElementById('transmit_port').value),
                 keyword: document.getElementById('keyword').value,
+                probe_devices_on_startup: document.getElementById('probe_devices_on_startup').checked,
                 device_timeout_minutes: parseInt(document.getElementById('device_timeout_minutes').value),
                 device_cleanup_hours: parseInt(document.getElementById('device_cleanup_hours').value)
             },

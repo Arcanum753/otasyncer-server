@@ -18,7 +18,8 @@
         "transmit_port": 40001,
         "keyword": "Ave_Omnissiah",
         "device_timeout_minutes": 10,
-        "device_cleanup_hours": 24
+        "device_cleanup_hours": 24,
+        "probe_devices_on_startup": true
     },
     "traffic_light": {
         "is_minutes_mode": true,
