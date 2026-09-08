@@ -144,6 +144,8 @@
         let html = '<div class="devices-table-wrapper">';
         html += '<table class="scan device-table">';
         html += '<thead><tr>';
+        html += '<th class="device-policy-col" title="Разрешить автообновление файловой системы">Обновление ФС</th>';
+        html += '<th class="device-policy-col" title="Разрешить автообновление прошивки">Обновление прошивки</th>';
         visibleFields.forEach(field => {
             html += '<th>' + (colLabels[field] || field) + '</th>';
         });
@@ -151,6 +153,16 @@
 
         devices.forEach(dev => {
             html += '<tr>';
+            html += '<td class="device-policy-col">'
+                 + '<input type="checkbox" class="update-policy-cb" data-mac="' + dev.mac + '" data-field="fs"'
+                 + (dev.allowFsUpdate ? ' checked' : '')
+                 + ' title="Разрешить автообновление файловой системы" onchange="setUpdatePolicy(this)">'
+                 + '</td>';
+            html += '<td class="device-policy-col">'
+                 + '<input type="checkbox" class="update-policy-cb" data-mac="' + dev.mac + '" data-field="fw"'
+                 + (dev.allowFwUpdate ? ' checked' : '')
+                 + ' title="Разрешить автообновление прошивки" onchange="setUpdatePolicy(this)">'
+                 + '</td>';
             visibleFields.forEach(field => {
                 let value = '';
                 if (field === 'status') {
@@ -250,6 +262,37 @@
         })
         .catch(err => {
             console.error('Save column format error:', err);
+        });
+    }
+
+    // ---- Set Update Policy (FS / Firmware per device) ----
+    function setUpdatePolicy(checkbox) {
+        const mac = checkbox.dataset.mac;
+        const field = checkbox.dataset.field;
+        const value = checkbox.checked;
+        const prevValue = !value;
+        const status = document.getElementById('probe-status');
+
+        const body = field === 'fw' ? { allowFwUpdate: value } : { allowFsUpdate: value };
+
+        fetch('/api/device/' + encodeURIComponent(mac) + '/update-policy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (!data.success) {
+                checkbox.checked = prevValue;
+                if (status) status.textContent = 'Error: ' + (data.error || 'Unknown');
+            } else {
+                if (status) status.textContent = '';
+            }
+        })
+        .catch(err => {
+            checkbox.checked = prevValue;
+            console.error('Set update policy error:', err);
+            if (status) status.textContent = 'Network error: ' + err;
         });
     }
 

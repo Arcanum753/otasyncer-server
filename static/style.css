@@ -519,6 +519,17 @@ iframe {
     padding: 4px 6px;
     white-space: nowrap;
 }
+/* Update policy columns (FS / Firmware checkboxes per device row) */
+.device-policy-col {
+    text-align: center;
+    white-space: nowrap;
+}
+.device-policy-col input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    cursor: pointer;
+    margin: 0;
+}
 
 /* Filter bar */
 .filter-bar {

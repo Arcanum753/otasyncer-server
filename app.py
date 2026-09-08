@@ -43,9 +43,7 @@ DEFAULT_CONFIG = {
     "port": 8080,
     "firmware_dirs": [{"path": "./firmware", "delete_old_versions": False}],
     "manifest_path": "/manifest.json",
-    "manifest": {
-        "entries_per_type": 2
-    },
+    "manifest": {},
     "udp_listener": {
         "is_listening": True,
         "receive_port": 40000,
@@ -142,6 +140,9 @@ class DeviceInfo:
     lastSeen: str = ""
     firstSeen: str = ""
     isOnline: bool = True
+    # Разрешения на автообновление (сервер решает через манифест)
+    allowFsUpdate: bool = True
+    allowFwUpdate: bool = True
 
     @staticmethod
     def from_json(data: dict) -> 'DeviceInfo':
@@ -346,6 +347,48 @@ class DeviceStorage:
         with self._lock:
             return self._devices.get(mac)
 
+    def set_update_policy(self, mac: str, fw: Optional[bool] = None, fs: Optional[bool] = None) -> Optional[DeviceInfo]:
+        """
+        Обновить разрешения на автообновление устройства.
+        Переданные аргументы None не меняются. Возвращает обновлённое устройство
+        или None, если устройство не найдено.
+        """
+        with self._lock:
+            dev = self._devices.get(mac)
+            if dev is None:
+                return None
+            if fw is not None:
+                dev.allowFwUpdate = bool(fw)
+            if fs is not None:
+                dev.allowFsUpdate = bool(fs)
+            self._save()
+            return dev
+
+    def find_device_for_update(self, ip: str, target: str = "") -> Optional[DeviceInfo]:
+        """
+        Найти устройство для запроса манифеста по IP источника HTTP-запроса.
+        Среди устройств с совпавшим ip предпочитаем совпадение target,
+        затем онлайн-устройство, затем самое свежее lastSeen.
+        """
+        if not ip:
+            return None
+        candidates = []
+        with self._lock:
+            for dev in self._devices.values():
+                if dev.ip != ip:
+                    continue
+                key = 0
+                if target and dev.target == target:
+                    key += 4
+                if dev.isOnline:
+                    key += 2
+                candidates.append((key, dev))
+        if not candidates:
+            return None
+        # sort: key убывает, среди равных — свежее lastSeen первым
+        candidates.sort(key=lambda x: (x[0], x[1].lastSeen), reverse=True)
+        return candidates[0][1]
+
     def get_devices_since(self, minutes: int = 0) -> list[DeviceInfo]:
         """
         Получить устройства, замеченные за последние N минут.
@@ -393,7 +436,10 @@ class DeviceStorage:
             for mac, dev in self._devices.items():
                 try:
                     last = datetime.fromisoformat(dev.lastSeen)
-                    if last < cutoff:
+                    # Записи с запретом обновлений не удаляем: иначе после
+                    # возврата устройства запрет потеряется (запись создастся
+                    # заново с разрешениями по умолчанию).
+                    if last < cutoff and dev.allowFwUpdate and dev.allowFsUpdate:
                         to_remove.append(mac)
                 except:
                     pass
@@ -1099,18 +1145,21 @@ def delete_firmware(filename):
 def manifest():
     """Generate manifest.json for OTA client devices.
 
+    Сервер сам решает, какие типы обновлений разрешены конкретному устройству:
+      — если тип запрещён — файлы этого типа в манифест не попадают;
+      — если тип разрешён — попадает только один самый свежий файл этого типа.
+
     Query parameters:
       target (str)  — BUILD_ENV устройства (обязательный)
       ver (str)     — текущая версия прошивки устройства (опционально, для лога)
+      mac (str)     — MAC устройства (опционально, для точной идентификации)
 
     Returns:
-      files (list)     — entries_per_type новейших файлов для каждого типа
-                         (FIRMWARE + FILESYS), отсортированные от новых к старым
-      has_files (bool) — true если файлы для этого target найдены
+      files (list)     — до одного самого свежего файла каждого разрешённого типа
+                         (FIRMWARE + FILESYS)
+      has_files (bool) — true если для этого устройства есть разрешённые файлы
     """
     target = request.args.get('target', '')
-    entries_per_type = config.get('manifest', {}).get('entries_per_type', 2)
-    entries_per_type = max(1, min(5, entries_per_type))
 
     if not target:
         return jsonify({"files": [], "has_files": False})
@@ -1151,12 +1200,32 @@ def manifest():
     firmware.sort(key=lambda x: x["_sort_key"], reverse=True)
     filesys.sort(key=lambda x: x["_sort_key"], reverse=True)
 
-    # Take N newest of each type, strip internal sort key
+    # Определяем устройство и его разрешения на обновление.
+    # Приоритет: mac из запроса, затем сопоставление по IP источника.
+    mac_q = (request.args.get('mac') or '').strip().upper()
+    dev = device_storage.get_device_by_mac(mac_q) if mac_q else None
+    if dev is None:
+        dev = device_storage.find_device_for_update(request.remote_addr or '', target)
+
+    if dev:
+        allow_fw = bool(dev.allowFwUpdate)
+        allow_fs = bool(dev.allowFsUpdate)
+        print(f"Manifest for {target} from {request.remote_addr}: {dev.mac} "
+              f"(fw={allow_fw}, fs={allow_fs})")
+    else:
+        allow_fw = True
+        allow_fs = True
+
+    # Сервер отдаёт ровно один самый свежий файл каждого разрешённого типа
     def strip_key(entry):
         return {"name": entry["name"], "type": entry["type"],
                 "size": entry["size"], "md5": entry["md5"]}
 
-    result = [strip_key(e) for e in (firmware[:entries_per_type] + filesys[:entries_per_type])]
+    result = []
+    if allow_fw and firmware:
+        result.append(strip_key(firmware[0]))
+    if allow_fs and filesys:
+        result.append(strip_key(filesys[0]))
 
     return jsonify({
         "files": result,
@@ -1327,6 +1396,31 @@ def api_device(mac):
     if not dev:
         return jsonify({"error": "Device not found"}), 404
     return jsonify(dev.to_dict())
+
+
+@app.route('/api/device/<mac>/update-policy', methods=['POST'])
+def api_device_update_policy(mac):
+    """
+    API: установить разрешения на автообновление устройства.
+    Тело: {"allowFwUpdate": true/false, "allowFsUpdate": true/false} — поля частичные.
+    """
+    try:
+        data = request.get_json(force=True) if request.is_json else None
+        if not data:
+            return jsonify({"success": False, "error": "No data"}), 400
+
+        dev = device_storage.set_update_policy(
+            mac,
+            fw=data.get("allowFwUpdate"),
+            fs=data.get("allowFsUpdate")
+        )
+        if dev is None:
+            return jsonify({"success": False, "error": "Device not found"}), 404
+
+        print(f"Update policy for {mac}: allowFwUpdate={dev.allowFwUpdate}, allowFsUpdate={dev.allowFsUpdate}")
+        return jsonify({"success": True, "device": dev.to_dict()})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ============================================================
