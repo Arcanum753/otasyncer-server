@@ -58,6 +58,10 @@ DEFAULT_CONFIG = {
         "green_time": 1,
         "yellow_time": 2,
         "red_time": 3
+    },
+    "logging": {
+        "enabled": True,
+        "directory": "log"
     }
 }
 
@@ -100,6 +104,125 @@ class _WerkzeugLogFilter(logging.Filter):
         return True
 
 logging.getLogger("werkzeug").addFilter(_WerkzeugLogFilter())
+
+
+# ============================================================
+# Файловые логи с почасовой ротацией
+# ============================================================
+class HourlyFileTee:
+    """
+    Перенаправляет stdout/stderr (в т.ч. print и логи werkzeug) в консоль
+    и одновременно в файл с почасовой ротацией.
+    Имя файла: <prefix>_YYYYMMDD_HHMMSS.log (маска по началу текущего часа).
+    """
+
+    def __init__(self, directory: str = "log", prefix: str = "otasyncer", enabled: bool = True):
+        self._lock = threading.Lock()
+        self._directory = directory
+        self._prefix = prefix
+        self._enabled = bool(enabled)
+        self._fh = None
+        self._period_key = None
+        self._console = sys.__stdout__
+
+    def set_enabled(self, enabled: bool):
+        with self._lock:
+            self._enabled = bool(enabled)
+            if not self._enabled:
+                self._close_locked()
+
+    def set_directory(self, directory: str):
+        with self._lock:
+            if directory != self._directory:
+                self._directory = directory
+                self._close_locked()
+                self._period_key = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def _close_locked(self):
+        if self._fh is not None:
+            try:
+                self._fh.flush()
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+    def _ensure_open_locked(self):
+        if not self._enabled:
+            return
+        now = datetime.now().replace(minute=0, second=0, microsecond=0)
+        key = now.strftime("%Y%m%d_%H%M%S")
+        if self._fh is not None and key == self._period_key:
+            return
+        self._close_locked()
+        try:
+            os.makedirs(self._directory, exist_ok=True)
+            path = os.path.join(self._directory, f"{self._prefix}_{key}.log")
+            self._fh = open(path, "a", encoding="utf-8")
+            self._period_key = key
+        except Exception as e:
+            self._fh = None
+            self._period_key = None
+            try:
+                self._console.write(f"[log] open file error: {e}\n")
+            except Exception:
+                pass
+
+    def write(self, data):
+        if not data:
+            return
+        with self._lock:
+            if self._enabled:
+                try:
+                    self._ensure_open_locked()
+                    if self._fh is not None:
+                        self._fh.write(data)
+                        if not data.endswith("\n"):
+                            self._fh.write("\n")
+                        self._fh.flush()
+                except Exception:
+                    pass
+        try:
+            self._console.write(data)
+            self._console.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                except Exception:
+                    pass
+        try:
+            self._console.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False
+
+
+log_tee = HourlyFileTee(enabled=False)
+
+
+def apply_logging_config(logging_cfg: dict):
+    """Применить настройки логирования (папка + вкл/выкл) к log_tee."""
+    global log_tee
+    directory = str(logging_cfg.get("directory", "log") or "log")
+    log_tee.set_directory(directory)
+    log_tee.set_enabled(bool(logging_cfg.get("enabled", True)))
+
+
+# Всегда перенаправляем вывод в tee: если файловые логи выключены,
+# tee работает как прозрачный проброс в консоль.
+sys.stdout = log_tee
+sys.stderr = log_tee
 
 
 # ============================================================
@@ -494,7 +617,7 @@ def load_config():
             merged = DEFAULT_CONFIG.copy()
             merged.update(cfg)
             # Убедимся, что вложенные секции есть
-            for section in ['udp_listener', 'traffic_light', 'manifest']:
+            for section in ['udp_listener', 'traffic_light', 'manifest', 'logging']:
                 if section not in merged:
                     merged[section] = DEFAULT_CONFIG[section].copy()
                 else:
@@ -525,7 +648,8 @@ def save_config(cfg):
         "firmware_dirs": normalized_dirs,
         "manifest_path": cfg.get("manifest_path", DEFAULT_CONFIG["manifest_path"]),
         "udp_listener": cfg.get("udp_listener", DEFAULT_CONFIG["udp_listener"]),
-        "traffic_light": cfg.get("traffic_light", DEFAULT_CONFIG["traffic_light"])
+        "traffic_light": cfg.get("traffic_light", DEFAULT_CONFIG["traffic_light"]),
+        "logging": cfg.get("logging", DEFAULT_CONFIG["logging"])
     }
     try:
         with open(CONFIG_FILE, 'w') as f:
@@ -839,6 +963,13 @@ class UdpListener:
 # ============================================================
 config = load_config()
 display_format = load_display_format()
+
+# Применить настройки файловых логов (папка + вкл/выкл)
+apply_logging_config(config.get("logging", DEFAULT_CONFIG["logging"]))
+if log_tee.enabled:
+    log_dir = config.get("logging", {}).get("directory", "log")
+    print(f"File logging enabled: logs are saved to '{os.path.join(log_dir, 'otasyncer_YYYYMMDD_HHMMSS.log')}' (hourly rotation)")
+
 device_storage = DeviceStorage(DEVICES_DB_FILE)
 event_log = EventLog()
 sse_manager = SseManager()
@@ -1320,7 +1451,8 @@ def get_config():
         "firmware_dirs": config["firmware_dirs"],
         "manifest_path": config["manifest_path"],
         "udp_listener": config.get("udp_listener", {}),
-        "traffic_light": config.get("traffic_light", {})
+        "traffic_light": config.get("traffic_light", {}),
+        "logging": config.get("logging", {})
     })
 
 
@@ -1493,6 +1625,7 @@ def udp_settings_page():
     return render_template('udp_settings.html',
         udp_config=udp_cfg,
         traffic_light=tl_cfg,
+        logging_config=config.get("logging", {}),
         listener_running=udp_listener.is_running,
         msg_count=udp_listener.msg_count
     )
@@ -1503,7 +1636,8 @@ def api_udp_config_get():
     """API: получить конфигурацию UDP."""
     return jsonify({
         "udp_listener": config.get("udp_listener", {}),
-        "traffic_light": config.get("traffic_light", {})
+        "traffic_light": config.get("traffic_light", {}),
+        "logging": config.get("logging", {})
     })
 
 
@@ -1536,6 +1670,18 @@ def api_udp_config_set():
             for k, v in data["traffic_light"].items():
                 config["traffic_light"][k] = v
             save_config(config)
+
+        # Обновляем настройки файловых логов
+        if "logging" in data:
+            new_logging = data["logging"]
+            for k, v in new_logging.items():
+                config["logging"][k] = v
+            if not config["logging"].get("directory"):
+                config["logging"]["directory"] = "log"
+            save_config(config)
+            apply_logging_config(config["logging"])
+            if config["logging"].get("enabled", True):
+                print(f"File logging enabled: saved to '{config['logging'].get('directory', 'log')}'")
 
         return jsonify({"success": True})
     except Exception as e:

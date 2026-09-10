@@ -26,5 +26,9 @@
         "green_time": 1,
         "yellow_time": 2,
         "red_time": 3
+    },
+    "logging": {
+        "enabled": true,
+        "directory": "log"
     }
 }

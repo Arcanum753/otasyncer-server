@@ -77,6 +77,22 @@
         </div>
 
         <div class="settings-group">
+            <h3>Logging</h3>
+            <div class="setting-row">
+                <label for="logging_enabled">Save logs to file:</label>
+                <input type="checkbox" id="logging_enabled"
+                       {% if logging_config.enabled %}checked{% endif %}>
+                <span class="setting-hint">Write server logs into the folder below (new file every hour: prefix_YYYYMMDD_HHMMSS.log)</span>
+            </div>
+            <div class="setting-row">
+                <label for="logging_directory">Log directory:</label>
+                <input type="text" id="logging_directory"
+                       value="{{ logging_config.directory }}"
+                       class="input-text">
+            </div>
+        </div>
+
+        <div class="settings-group">
             <h3>Traffic Light Settings</h3>
             <p style="font-size:12px; color:#666; margin:0 0 10px 0;">
                 Preserved for session seamlessness (from AppSettings.cs).
@@ -157,6 +173,10 @@
                 green_time: parseInt(document.getElementById('green_time').value),
                 yellow_time: parseInt(document.getElementById('yellow_time').value),
                 red_time: parseInt(document.getElementById('red_time').value)
+            },
+            logging: {
+                enabled: document.getElementById('logging_enabled').checked,
+                directory: document.getElementById('logging_directory').value
             }
         };
 
@@ -180,6 +200,14 @@
         .finally(() => {
             btn.disabled = false;
         });
+    }
+
+    const logChk = document.getElementById('logging_enabled');
+    const logDir = document.getElementById('logging_directory');
+    if (logChk && logDir) {
+        const syncDirState = () => { logDir.disabled = !logChk.checked; };
+        logChk.addEventListener('change', syncDirState);
+        syncDirState();
     }
     </script>
 </body>
