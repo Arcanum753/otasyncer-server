@@ -1783,4 +1783,7 @@ if __name__ == '__main__':
     print(f"UDP Listener:    {'Running' if udp_listener.is_running else 'Stopped'}")
     print(f"Devices tracked: {device_storage.get_total_count()}")
 
-    app.run(host=config['host'], port=config['port'], debug=True)
+    # use_reloader=False: иначе Werkzeug порождает второй процесс, модульный код
+    # выполняется дважды, оба процесса биндят UDP :40000. Пакеты достаются
+    # родителю, а HTTP-процесс держит устаревший device_storage (см. «No devices found»).
+    app.run(host=config['host'], port=config['port'], debug=True, use_reloader=False)
