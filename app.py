@@ -265,8 +265,10 @@ class DeviceInfo:
     firstSeen: str = ""
     isOnline: bool = True
     # Разрешения на автообновление (сервер решает через манифест)
-    allowFsUpdate: bool = True
-    allowFwUpdate: bool = True
+    # По умолчанию запрещены — новые устройства не обновляются автоматически,
+    # пока администратор явно не разрешит в /devices.
+    allowFsUpdate: bool = False
+    allowFwUpdate: bool = False
 
     @staticmethod
     def from_json(data: dict) -> 'DeviceInfo':
@@ -560,10 +562,11 @@ class DeviceStorage:
             for mac, dev in self._devices.items():
                 try:
                     last = datetime.fromisoformat(dev.lastSeen)
-                    # Записи с запретом обновлений не удаляем: иначе после
-                    # возврата устройства запрет потеряется (запись создастся
-                    # заново с разрешениями по умолчанию).
-                    if last < cutoff and dev.allowFwUpdate and dev.allowFsUpdate:
+                    # Удаляем только записи с политикой по умолчанию (оба запрещены).
+                    # Устройства, которым администратор явно разрешил обновления,
+                    # сохраняем: иначе при возврате устройства явное разрешение
+                    # потеряется (запись создастся заново с запретом по умолчанию).
+                    if last < cutoff and not dev.allowFwUpdate and not dev.allowFsUpdate:
                         to_remove.append(mac)
                 except:
                     pass
@@ -1403,8 +1406,9 @@ def manifest():
         print(f"Manifest for {target} from {request.remote_addr}: {dev.mac} "
               f"(fw={allow_fw}, fs={allow_fs})")
     else:
-        allow_fw = True
-        allow_fs = True
+        # Устройство не найдено — применяем политику по умолчанию: всё запрещено.
+        allow_fw = False
+        allow_fs = False
 
     # Сервер отдаёт ровно один самый свежий файл каждого разрешённого типа
     def strip_key(entry):
