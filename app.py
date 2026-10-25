@@ -21,9 +21,15 @@ import struct
 import time
 import queue
 import copy
+import re
+import shutil
+import ipaddress
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from urllib.parse import quote
+
+import requests
 
 from flask import Flask, request, redirect, url_for, send_file, jsonify, render_template, Response
 from werkzeug.utils import secure_filename
@@ -44,6 +50,14 @@ DEFAULT_CONFIG = {
     "firmware_dirs": [{"path": "./firmware", "delete_old_versions": False}],
     "manifest_path": "/manifest.json",
     "manifest": {},
+    "device_username": "",
+    "device_password": "",
+    "backup": {
+        "dir": "./backups",
+        "timeout_s": 10,
+        "inter_request_delay_ms": 150,
+        "extra_config_files": []
+    },
     "udp_listener": {
         "is_listening": True,
         "receive_port": 40000,
@@ -86,6 +100,54 @@ DEFAULT_DISPLAY_FORMAT = {
         {"field": "udpTimeOut",  "label": "UDP Timeout",  "width": 80,   "visible": False},
         {"field": "keyword",     "label": "Keyword",      "width": 120,  "visible": False}
     ]
+}
+
+# ============================================================
+# Бэкап конфигов и скриптов с устройств
+# ============================================================
+BACKUP_SCHEMA_VERSION = 1
+BACKUP_DEFAULT_DIR = "./backups"
+BACKUP_DEFAULT_TIMEOUT_S = 10
+BACKUP_DEFAULT_DELAY_MS = 150
+
+# JSON-файлы, которые проверяются всегда (ядро + секреты + метаданные ФС).
+BACKUP_CORE_FILES = [
+    "/config_sys.json",
+    "/config_time.json",
+    "/config_ntp.json",
+    "/config_wifi.json",
+    "/config_wifi0.json",
+    "/config_wifi1.json",
+    "/config_wifi2.json",
+    "/config_wifi3.json",
+    "/config_state.json",
+    "/secret.json",
+    "/_version_fs.json",
+]
+
+# Карта: имя компонента из modules.included (_version_fs.json) -> JSON-файлы.
+BACKUP_MODULE_CONFIGS = {
+    "module_udp": ["/config_udp.json"],
+    "module_ds3231": ["/config_ds3231.json"],
+    "module_otaclient": ["/config_otaclient.json"],
+    "module_macros": ["/config_macros.json", "/macros/resources.json"],
+    "module_rgb": ["/config_rgb.json"],
+    "module_lcd-i2c": ["/config_lcd-i2c.json"],
+    "module_veml7700": ["/config_veml7700.json"],
+    "module_program": ["/config_prog.json"],
+    "module_prog": ["/config_prog.json"],
+    "submodule_isp": ["/avrisp_cfg.json", "/avrisp.json"],
+    "submodule_swd": ["/swd_cfg.json"],
+    "module_template": ["/config_template.json"],
+    "device_clock-mech": ["/config_clock-mech.json"],
+    "device_mech-ring": ["/config_ring-mech.json"],
+    "device_electronica7_rgb": ["/config_e7rgb.json"],
+}
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *{f"COM{i}" for i in range(1, 10)},
+    *{f"LPT{i}" for i in range(1, 10)},
 }
 
 # ============================================================
@@ -617,17 +679,17 @@ def load_config():
         try:
             with open(CONFIG_FILE, 'r') as f:
                 cfg = json.load(f)
-            merged = DEFAULT_CONFIG.copy()
+            merged = copy.deepcopy(DEFAULT_CONFIG)
             merged.update(cfg)
             # Убедимся, что вложенные секции есть
-            for section in ['udp_listener', 'traffic_light', 'manifest', 'logging']:
-                if section not in merged:
-                    merged[section] = DEFAULT_CONFIG[section].copy()
+            for section in ['udp_listener', 'traffic_light', 'manifest', 'logging', 'backup']:
+                if section not in merged or not isinstance(merged[section], dict):
+                    merged[section] = copy.deepcopy(DEFAULT_CONFIG[section])
                 else:
                     dflt = DEFAULT_CONFIG[section]
                     for k, v in dflt.items():
                         if k not in merged[section]:
-                            merged[section][k] = v
+                            merged[section][k] = copy.deepcopy(v)
             # Ensure firmware_dirs is a list and normalize to dict format
             if not isinstance(merged["firmware_dirs"], list):
                 merged["firmware_dirs"] = [merged["firmware_dirs"]]
@@ -635,8 +697,8 @@ def load_config():
             return merged
         except Exception as e:
             print(f"Error loading config: {e}")
-            return DEFAULT_CONFIG.copy()
-    return DEFAULT_CONFIG.copy()
+            return copy.deepcopy(DEFAULT_CONFIG)
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_config(cfg):
@@ -650,6 +712,10 @@ def save_config(cfg):
         "port": cfg.get("port", DEFAULT_CONFIG["port"]),
         "firmware_dirs": normalized_dirs,
         "manifest_path": cfg.get("manifest_path", DEFAULT_CONFIG["manifest_path"]),
+        "manifest": cfg.get("manifest", DEFAULT_CONFIG["manifest"]),
+        "device_username": cfg.get("device_username", DEFAULT_CONFIG["device_username"]),
+        "device_password": cfg.get("device_password", DEFAULT_CONFIG["device_password"]),
+        "backup": cfg.get("backup", DEFAULT_CONFIG["backup"]),
         "udp_listener": cfg.get("udp_listener", DEFAULT_CONFIG["udp_listener"]),
         "traffic_light": cfg.get("traffic_light", DEFAULT_CONFIG["traffic_light"]),
         "logging": cfg.get("logging", DEFAULT_CONFIG["logging"])
@@ -684,6 +750,719 @@ def save_display_format(fmt):
     except Exception as e:
         print(f"Error saving display format: {e}")
         return False
+
+
+# ============================================================
+# Бэкап конфигов и скриптов с устройств
+# ============================================================
+
+_BACKUP_LOCK = threading.Lock()
+_BACKUP_STATE = {
+    "running": False,
+    "startedAt": None,
+    "finishedAt": None,
+    "total": 0,
+    "done": 0,
+    "current": "",
+    "results": [],
+    "error": None,
+}
+
+
+def _int_value(value, default, minimum=0):
+    """Привести значение из JSON к int с ограничением снизу."""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, result)
+
+
+def _backup_settings():
+    """Актуальные настройки бэкапа (с дефолтами)."""
+    cfg = config.get("backup", {}) or {}
+    return {
+        "dir": str(cfg.get("dir") or BACKUP_DEFAULT_DIR),
+        "timeout_s": _int_value(cfg.get("timeout_s"), BACKUP_DEFAULT_TIMEOUT_S, 1),
+        "delay_ms": _int_value(cfg.get("inter_request_delay_ms"), BACKUP_DEFAULT_DELAY_MS, 0),
+        "extra_config_files": cfg.get("extra_config_files") or [],
+    }
+
+
+def _device_auth():
+    """HTTP Basic для устройств (None, если креды не заданы)."""
+    user = str(config.get("device_username") or "").strip()
+    password = str(config.get("device_password") or "")
+    if user and password:
+        return (user, password)
+    return None
+
+
+def _sanitize_name(value, fallback=""):
+    """Безопасное имя файла/папки (Unicode сохраняется)."""
+    text = str(value or "").strip()
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text)
+    text = re.sub(r"\s+", "_", text)
+    text = text.strip(" .")
+    if not text:
+        return fallback
+    if text.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+        text = "_" + text
+    return text[:64]
+
+
+def _safe_rel_path(path):
+    """Превратить путь внутри ФС устройства в безопасный относительный путь."""
+    text = str(path or "").replace("\\", "/").strip()
+    parts = []
+    for segment in text.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            return None
+        cleaned = _sanitize_name(segment, "")
+        if not cleaned:
+            continue
+        parts.append(cleaned[:128])
+    if not parts:
+        return None
+    return os.path.join(*parts)
+
+
+def _unique_rel_path(rel_path, used):
+    """Развести совпадающие относительные пути суффиксом _2, _3, ..."""
+    key = rel_path.lower()
+    if key not in used:
+        used.add(key)
+        return rel_path
+    base, ext = os.path.splitext(rel_path)
+    index = 2
+    while f"{base}_{index}{ext}".lower() in used:
+        index += 1
+    result = f"{base}_{index}{ext}"
+    used.add(result.lower())
+    return result
+
+
+def _validate_ip(ip):
+    """Проверить, что IP — корректный IPv4-адрес."""
+    try:
+        addr = ipaddress.ip_address(str(ip or "").strip())
+    except ValueError:
+        return None
+    if addr.version != 4:
+        return None
+    return str(addr)
+
+
+def _device_get(ip, path, cfg, auth):
+    """GET с устройства (последовательно, с закрытием соединения)."""
+    timeout = cfg.get("timeout_s", BACKUP_DEFAULT_TIMEOUT_S)
+    return requests.get(
+        f"http://{ip}{path}",
+        timeout=(min(5, timeout), timeout),
+        auth=auth,
+        headers={"Connection": "close"},
+        allow_redirects=False,
+    )
+
+
+def _parse_cvt(text):
+    """Разобрать ответ /system/version формата key|value|div."""
+    result = {}
+    for line in (text or "").splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2:
+            result[parts[0].strip()] = parts[1].strip()
+    return result
+
+
+def _looks_like_html(data, headers=None):
+    """Отличить HTML-страницу 404 от файла (ESP отдаёт её с кодом 200)."""
+    content_type = ""
+    if headers:
+        content_type = str(headers.get("Content-Type") or "").lower()
+    if "text/html" in content_type:
+        return True
+    head = (data or b"")[:512].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def _valid_json_bytes(data):
+    """Проверить, что содержимое — валидный JSON."""
+    try:
+        json.loads((data or b"").decode("utf-8-sig"))
+        return True
+    except (UnicodeDecodeError, ValueError):
+        return False
+
+
+def _fetch_identity(ip, cfg, auth):
+    """Вернуть (info, raw_text, error, fatal)."""
+    try:
+        resp = _device_get(ip, "/system/version", cfg, auth)
+    except Exception as e:
+        return {}, "", f"/system/version: {e}", True
+    if resp.status_code == 200:
+        raw = resp.text or ""
+        return _parse_cvt(raw), raw, None, False
+    if resp.status_code == 401:
+        return {}, "", "HTTP 401: check device_username/device_password", True
+    return {}, "", f"/system/version: HTTP {resp.status_code}", False
+
+
+def _fetch_version_json(ip, cfg, auth):
+    """Вернуть (content, parsed_json, error, fatal)."""
+    try:
+        resp = _device_get(ip, "/_version_fs.json", cfg, auth)
+    except Exception as e:
+        return None, None, f"/_version_fs.json: {e}", False
+    if resp.status_code == 200:
+        if _looks_like_html(resp.content, resp.headers):
+            return None, None, "/_version_fs.json: HTML page (ignored)", False
+        if not _valid_json_bytes(resp.content):
+            return None, None, "/_version_fs.json: invalid JSON (ignored)", False
+        try:
+            return resp.content, resp.json(), None, False
+        except ValueError:
+            return None, None, "/_version_fs.json: invalid JSON (ignored)", False
+    if resp.status_code == 404:
+        return None, None, None, False
+    if resp.status_code == 401:
+        return None, None, "/_version_fs.json: HTTP 401 (auth)", True
+    return None, None, f"/_version_fs.json: HTTP {resp.status_code}", False
+
+
+def _module_config_paths(version_json):
+    """JSON-пути модулей по modules.included (или все известные)."""
+    included = []
+    if isinstance(version_json, dict):
+        modules = version_json.get("modules")
+        if isinstance(modules, dict) and isinstance(modules.get("included"), list):
+            included = [str(item) for item in modules["included"] if isinstance(item, str)]
+
+    paths = []
+    if included:
+        for name in included:
+            paths.extend(BACKUP_MODULE_CONFIGS.get(name, []))
+    else:
+        for values in BACKUP_MODULE_CONFIGS.values():
+            paths.extend(values)
+    return paths
+
+
+def _candidate_specs(version_json, extra_files):
+    """Список (request_path, relative_file_path) для JSON-конфигов."""
+    raw_paths = list(BACKUP_CORE_FILES) + _module_config_paths(version_json) + list(extra_files or [])
+    specs = []
+    seen = set()
+    for raw in raw_paths:
+        if not isinstance(raw, str):
+            continue
+        path = "/" + raw.strip().lstrip("/")
+        parts = [part for part in path.split("/") if part]
+        if not parts or any(part == ".." for part in parts):
+            continue
+        if path in seen:
+            continue
+        rel_path = _safe_rel_path("/".join(parts))
+        if not rel_path:
+            continue
+        seen.add(path)
+        specs.append((path, rel_path))
+    return specs
+
+
+def _fetch_macro_names(ip, cfg, auth, result):
+    """Имена Lua-файлов из /macros/list (пусто, если модуля нет)."""
+    try:
+        resp = _device_get(ip, "/macros/list", cfg, auth)
+    except Exception as e:
+        result["errors"].append(f"/macros/list: {e}")
+        return []
+    if resp.status_code == 200:
+        if _looks_like_html(resp.content, resp.headers):
+            result["warnings"].append("/macros/list: HTML page (module_macros not built)")
+            return []
+        try:
+            data = resp.json()
+        except ValueError:
+            result["errors"].append("/macros/list: invalid JSON")
+            return []
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, list):
+            return []
+        names = []
+        for item in files:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                name = item["name"].strip()
+                if name:
+                    names.append(name)
+        return names
+    if resp.status_code == 404:
+        return []
+    if resp.status_code == 401:
+        result["errors"].append("/macros/list: HTTP 401 (auth)")
+        return []
+    result["errors"].append(f"/macros/list: HTTP {resp.status_code}")
+    return []
+
+
+def _macro_specs(names, warnings):
+    """Список (request_path, relative_file_path) для Lua-скриптов."""
+    specs = []
+    used = set()
+    seen = set()
+    for name in names:
+        base = str(name or "").replace("\\", "/").strip().lstrip("/")
+        if base.startswith("macros/"):
+            base = base[len("macros/"):]
+        if not base or "/" in base or base in (".", ".."):
+            warnings.append(f"macro skipped (bad name): {name}")
+            continue
+        if not base.lower().endswith(".lua"):
+            warnings.append(f"macro skipped (not .lua): {name}")
+            continue
+        if base.lower() in seen:
+            continue
+        seen.add(base.lower())
+        rel_path = _safe_rel_path(os.path.join("macros", base))
+        if not rel_path:
+            warnings.append(f"macro skipped (bad path): {name}")
+            continue
+        rel_path = _unique_rel_path(rel_path, used)
+        specs.append(("/macros/" + quote(base, safe=""), rel_path))
+    return specs
+
+
+def _backup_delay(cfg):
+    """Пауза между запросами к устройству."""
+    delay_ms = cfg.get("delay_ms", 0)
+    if delay_ms > 0:
+        time.sleep(delay_ms / 1000.0)
+
+
+def _write_file(root, rel_path, data):
+    """Записать файл, не выходя за пределы корневой папки."""
+    root_abs = os.path.abspath(root)
+    dest = os.path.abspath(os.path.join(root_abs, rel_path))
+    if os.path.commonpath([root_abs, dest]) != root_abs:
+        raise ValueError(f"path escapes backup folder: {rel_path}")
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(dest, "wb") as f:
+        f.write(data)
+
+
+def _write_json_file(root, rel_path, data):
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    _write_file(root, rel_path, payload)
+
+
+def _folder_owner_mac(folder_path):
+    """MAC владельца существующей папки бэкапа (пусто, если meta нет)."""
+    meta_path = os.path.join(folder_path, "meta.json")
+    if not os.path.isfile(meta_path):
+        return ""
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        device = meta.get("device") if isinstance(meta, dict) else None
+        return str((device or {}).get("mac") or "").lower()
+    except Exception:
+        return ""
+
+
+def _pick_device_folder(live, dev, backup_root, reserved):
+    """Имя папки: devicename_serial с защитой от коллизий."""
+    name = _sanitize_name((live or {}).get("devicename") or dev.get("deviceName", ""))
+    serial = _sanitize_name((live or {}).get("deviceserial") or dev.get("deviceSerial", ""))
+    mac = str(dev.get("mac") or "")
+    mac6 = re.sub(r"[^0-9A-Za-z]", "", mac)[-6:].upper() or "unknown"
+
+    if name and serial:
+        base = f"{name}_{serial}"
+    elif name:
+        base = name
+    elif serial:
+        base = serial
+    else:
+        base = f"device_{mac6}"
+    base = base[:120].strip(" ._") or f"device_{mac6}"
+
+    candidates = [base, f"{base}__{mac6}"]
+    candidates += [f"{base}__{mac6}_{index}" for index in range(2, 100)]
+    for candidate in candidates:
+        if candidate.lower() in reserved:
+            continue
+        owner = _folder_owner_mac(os.path.join(backup_root, candidate))
+        if owner and owner != mac.lower():
+            continue
+        reserved.add(candidate.lower())
+        return candidate
+
+    fallback = f"{base}__{mac6}_{int(time.time())}"
+    reserved.add(fallback.lower())
+    return fallback
+
+
+def _cleanup_backup_staging(backup_root):
+    """Удалить незавершённые staging-папки при старте."""
+    try:
+        os.makedirs(backup_root, exist_ok=True)
+        for entry in os.listdir(backup_root):
+            if entry.startswith(".incoming-") or entry.startswith(".old-"):
+                shutil.rmtree(os.path.join(backup_root, entry), ignore_errors=True)
+    except Exception as e:
+        print(f"Backup staging cleanup error: {e}")
+
+
+def _publish_backup(staging, target):
+    """Заменить папку устройства подготовленной staging-папкой."""
+    old = None
+    if os.path.isdir(target):
+        old = target + ".old-" + str(os.getpid()) + "-" + str(int(time.time() * 1000))
+        os.replace(target, old)
+    try:
+        os.replace(staging, target)
+    except Exception:
+        if old and not os.path.isdir(target):
+            os.replace(old, target)
+            old = None
+        raise
+    finally:
+        if old:
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def _download_specs(specs, ip, cfg, auth, staging, result, prefetched, used_rel):
+    """Скачать список файлов в staging. Вернуть (stored_files, fatal)."""
+    stored_files = []
+    for request_path, rel_path in specs:
+        made_request = False
+        resp_headers = None
+        if request_path == "/_version_fs.json" and request_path in prefetched:
+            status = 200
+            data = prefetched[request_path]
+        else:
+            try:
+                resp = _device_get(ip, request_path, cfg, auth)
+                status = resp.status_code
+                data = resp.content if status == 200 else b""
+                resp_headers = resp.headers
+                made_request = True
+            except Exception as e:
+                result["errors"].append(f"{request_path}: {e}")
+                _backup_delay(cfg)
+                continue
+
+        if status == 200:
+            is_html = _looks_like_html(data, resp_headers)
+            is_bad_json = request_path.lower().endswith(".json") and not _valid_json_bytes(data)
+            if is_html or is_bad_json:
+                result["missing"].append(request_path)
+                reason = "HTML page instead of file" if is_html else "invalid JSON"
+                result["warnings"].append(f"{request_path}: {reason} (ignored)")
+            else:
+                stored_rel = _unique_rel_path(rel_path, used_rel)
+                _write_file(staging, stored_rel, data)
+                stored_files.append({
+                    "path": request_path,
+                    "file": stored_rel.replace(os.sep, "/"),
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                })
+                result["files"] += 1
+                result["bytes"] += len(data)
+        elif status == 404:
+            result["missing"].append(request_path)
+        elif status == 403:
+            result["warnings"].append(f"{request_path}: HTTP 403 (hidden)")
+        elif status == 401:
+            result["errors"].append(f"{request_path}: HTTP 401 (auth)")
+            return stored_files, True
+        else:
+            result["errors"].append(f"{request_path}: HTTP {status}")
+
+        if made_request:
+            _backup_delay(cfg)
+
+    return stored_files, False
+
+
+def _backup_one_device(dev, cfg, auth, backup_root, reserved):
+    """Выгрузить конфиги и скрипты одного устройства."""
+    mac = str(dev.get("mac") or "")
+    result = {
+        "mac": mac,
+        "deviceName": str(dev.get("deviceName") or ""),
+        "deviceSerial": str(dev.get("deviceSerial") or ""),
+        "ip": str(dev.get("ip") or ""),
+        "folder": "",
+        "ok": False,
+        "files": 0,
+        "bytes": 0,
+        "missing": [],
+        "warnings": [],
+        "errors": [],
+    }
+
+    ip = _validate_ip(dev.get("ip"))
+    if not ip:
+        result["errors"].append("Invalid or empty IP")
+        return result
+    result["ip"] = ip
+
+    live, raw_version, identity_error, identity_fatal = _fetch_identity(ip, cfg, auth)
+    if identity_error:
+        if identity_fatal:
+            result["errors"].append(identity_error)
+            return result
+        result["warnings"].append(identity_error)
+
+    version_content, version_json, version_error, version_fatal = _fetch_version_json(ip, cfg, auth)
+    if version_error:
+        if version_fatal:
+            result["errors"].append(version_error)
+            return result
+        result["warnings"].append(version_error)
+
+    folder = _pick_device_folder(live, dev, backup_root, reserved)
+    result["folder"] = folder
+    result["deviceName"] = str(live.get("devicename") or dev.get("deviceName") or "")
+    result["deviceSerial"] = str(live.get("deviceserial") or dev.get("deviceSerial") or "")
+
+    config_specs = _candidate_specs(version_json, cfg.get("extra_config_files"))
+
+    staging = os.path.join(
+        backup_root,
+        f".incoming-{folder}-{os.getpid()}-{int(time.time() * 1000)}",
+    )
+    os.makedirs(staging, exist_ok=False)
+
+    used_rel = set()
+    prefetched = {}
+    if version_content is not None:
+        prefetched["/_version_fs.json"] = version_content
+
+    try:
+        # Сначала конфиги: /macros/list — самый тяжёлый эндпоинт и может уронить heap.
+        stored_files, fatal = _download_specs(
+            config_specs, ip, cfg, auth, staging, result, prefetched, used_rel
+        )
+
+        # Скрипты — только после конфигов и только если нет фатальной ошибки auth.
+        if not fatal:
+            macro_names = _fetch_macro_names(ip, cfg, auth, result)
+            macro_specs = _macro_specs(macro_names, result["warnings"])
+            stored_scripts, _ = _download_specs(
+                macro_specs, ip, cfg, auth, staging, result, prefetched, used_rel
+            )
+            stored_files.extend(stored_scripts)
+
+        meta = {
+            "schema": BACKUP_SCHEMA_VERSION,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "folder": folder,
+            "device": {
+                "mac": mac,
+                "name": result["deviceName"],
+                "serial": result["deviceSerial"],
+                "ip": ip,
+                "target": str(dev.get("target") or ""),
+                "espVer": str(dev.get("espVer") or ""),
+                "versionapp": str(live.get("versionapp") or ""),
+                "versionfs": str(live.get("versionfs") or ""),
+                "buildenv": str(live.get("buildenv") or ""),
+                "gitbranch": str(live.get("gitbranch") or ""),
+                "gitcommit": str(live.get("gitcommit") or ""),
+            },
+            "systemVersionRaw": raw_version,
+            "containsSecrets": True,
+            "files": stored_files,
+            "missing": result["missing"],
+            "warnings": result["warnings"],
+            "errors": result["errors"],
+        }
+        _write_json_file(staging, "meta.json", meta)
+
+        if result["files"] == 0:
+            result["errors"].append("No files downloaded")
+            shutil.rmtree(staging, ignore_errors=True)
+            return result
+
+        target = os.path.join(backup_root, folder)
+        if result["errors"]:
+            result["ok"] = False
+            if os.path.isdir(target):
+                shutil.rmtree(staging, ignore_errors=True)
+                result["warnings"].append("Existing backup kept (new backup incomplete)")
+                return result
+        else:
+            result["ok"] = True
+
+        _publish_backup(staging, target)
+    except Exception as e:
+        result["errors"].append(str(e))
+        shutil.rmtree(staging, ignore_errors=True)
+    return result
+
+
+def _backup_state_snapshot():
+    with _BACKUP_LOCK:
+        return copy.deepcopy(_BACKUP_STATE)
+
+
+def _broadcast_backup_event(event_type, message, **extra):
+    """Записать событие в лог и разослать подписчикам SSE."""
+    event = {
+        "type": event_type,
+        "message": message,
+        "device_mac": extra.get("device_mac", ""),
+        "device_name": extra.get("device_name", ""),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    for key in ("folder", "ok", "files", "bytes", "error"):
+        if key in extra:
+            event[key] = extra[key]
+    event_log.add(event)
+    sse_manager.broadcast(event)
+
+
+def _backup_worker(devices, cfg, auth):
+    """Фоновый последовательный обход устройств."""
+    total = len(devices)
+    backup_root = os.path.abspath(cfg["dir"])
+    reserved = set()
+    fatal_error = None
+
+    try:
+        _broadcast_backup_event("backup_started", f"Backup started: {total} device(s)")
+        for index, dev in enumerate(devices, 1):
+            mac = str(dev.get("mac") or "")
+            display_name = str(dev.get("deviceName") or mac)
+            with _BACKUP_LOCK:
+                _BACKUP_STATE["current"] = display_name
+
+            try:
+                result = _backup_one_device(dev, cfg, auth, backup_root, reserved)
+            except Exception as e:
+                result = {
+                    "mac": mac,
+                    "deviceName": display_name,
+                    "deviceSerial": str(dev.get("deviceSerial") or ""),
+                    "ip": str(dev.get("ip") or ""),
+                    "folder": "",
+                    "ok": False,
+                    "files": 0,
+                    "bytes": 0,
+                    "missing": [],
+                    "warnings": [],
+                    "errors": [str(e)],
+                }
+
+            with _BACKUP_LOCK:
+                _BACKUP_STATE["done"] = index
+                _BACKUP_STATE["results"].append(copy.deepcopy(result))
+
+            device_name = result.get("deviceName") or display_name
+            folder = result.get("folder") or ""
+            errors = "; ".join(result.get("errors") or [])
+            if result.get("ok"):
+                message = (
+                    f"[{index}/{total}] {device_name}: "
+                    f"{result.get('files', 0)} file(s), {result.get('bytes', 0)} bytes"
+                    + (f" -> {folder}" if folder else "")
+                )
+            else:
+                message = f"[{index}/{total}] {device_name}: error ({errors or 'unknown error'})"
+
+            _broadcast_backup_event(
+                "backup_device_done",
+                message,
+                device_mac=mac,
+                device_name=device_name,
+                folder=folder,
+                ok=bool(result.get("ok")),
+                files=result.get("files", 0),
+                bytes=result.get("bytes", 0),
+                error=errors,
+            )
+    except Exception as e:
+        fatal_error = str(e)
+        print(f"Backup worker error: {e}")
+    finally:
+        with _BACKUP_LOCK:
+            _BACKUP_STATE["running"] = False
+            _BACKUP_STATE["current"] = ""
+            _BACKUP_STATE["finishedAt"] = datetime.now(timezone.utc).isoformat()
+            _BACKUP_STATE["error"] = fatal_error
+            snapshot = copy.deepcopy(_BACKUP_STATE)
+
+        ok_count = sum(1 for item in snapshot.get("results", []) if item.get("ok"))
+        message = f"Backup finished: {ok_count}/{snapshot.get('total', total)} device(s) ok"
+        if fatal_error:
+            message += f" (error: {fatal_error})"
+        _broadcast_backup_event(
+            "backup_finished",
+            message,
+            ok=not fatal_error and ok_count == snapshot.get("total", total),
+        )
+
+
+def _start_backup(macs):
+    """Запустить фоновое задание. Вернуть (count, error)."""
+    unique = []
+    seen = set()
+    for mac in macs:
+        if not isinstance(mac, str):
+            continue
+        value = mac.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+
+    if not unique:
+        return None, "No MACs provided"
+
+    devices = []
+    unknown = []
+    for mac in unique:
+        device = device_storage.get_device_by_mac(mac)
+        if device is None:
+            unknown.append(mac)
+        else:
+            devices.append(device.to_dict())
+
+    if unknown:
+        return None, "Unknown device(s): " + ", ".join(unknown)
+
+    with _BACKUP_LOCK:
+        if _BACKUP_STATE["running"]:
+            return None, "Backup already running"
+        _BACKUP_STATE.update({
+            "running": True,
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "finishedAt": None,
+            "total": len(devices),
+            "done": 0,
+            "current": "",
+            "results": [],
+            "error": None,
+        })
+
+    cfg = _backup_settings()
+    auth = _device_auth()
+    thread = threading.Thread(
+        target=_backup_worker,
+        args=(devices, cfg, auth),
+        daemon=True,
+        name="device-backup",
+    )
+    thread.start()
+    return len(devices), None
 
 
 # ============================================================
@@ -1016,6 +1795,13 @@ if config.get("udp_listener", {}).get("probe_devices_on_startup", True):
 for entry in config["firmware_dirs"]:
     dir_path = entry["path"] if isinstance(entry, dict) else entry
     os.makedirs(dir_path, exist_ok=True)
+
+# Каталог бэкапов и очистка незавершённых staging-папок
+try:
+    _backup_root = os.path.abspath(_backup_settings()["dir"])
+    _cleanup_backup_staging(_backup_root)
+except Exception as e:
+    print(f"Backup init error: {e}")
 
 
 # ============================================================
@@ -1454,6 +2240,9 @@ def get_config():
         "port": config["port"],
         "firmware_dirs": config["firmware_dirs"],
         "manifest_path": config["manifest_path"],
+        "device_username": config.get("device_username", ""),
+        "device_password_configured": bool(config.get("device_password")),
+        "backup": config.get("backup", {}),
         "udp_listener": config.get("udp_listener", {}),
         "traffic_light": config.get("traffic_light", {}),
         "logging": config.get("logging", {})
@@ -1616,6 +2405,30 @@ def api_device_update_policy(mac):
         return jsonify({"success": True, "device": dev.to_dict()})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/devices/backup', methods=['POST'])
+def api_devices_backup():
+    """API: запустить фоновый бэкап выбранных устройств."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        macs = data.get("macs")
+        if not isinstance(macs, list) or not macs:
+            return jsonify({"success": False, "error": "macs must be a non-empty list"}), 400
+
+        count, error = _start_backup(macs)
+        if error:
+            status = 409 if error == "Backup already running" else 400
+            return jsonify({"success": False, "error": error}), status
+        return jsonify({"success": True, "total": count}), 202
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/devices/backup/status', methods=['GET'])
+def api_devices_backup_status():
+    """API: состояние текущего/последнего бэкапа."""
+    return jsonify({"success": True, "state": _backup_state_snapshot()})
 
 
 # ============================================================

@@ -768,3 +768,58 @@ iframe {
     text-align: center;
     padding: 10px 0 0 0;
 }
+
+/* ============================================================
+   Backup Styles
+   ============================================================ */
+
+.select-col {
+    width: 34px;
+    text-align: center;
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+}
+
+.select-col input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+    margin: 0;
+    vertical-align: middle;
+}
+
+.device-table tr.selected-row td {
+    background: #eef2ff;
+}
+
+.backup-status {
+    display: inline-block;
+    margin-left: 10px;
+    font-size: 13px;
+    color: #247;
+    font-weight: bold;
+    vertical-align: middle;
+}
+
+.button:disabled,
+.button[disabled] {
+    cursor: not-allowed;
+    opacity: 0.55;
+    background-image: none;
+    background-color: #e5e5e0;
+    color: #777;
+}
+
+.event-log-backup {
+    background: #eef7ff;
+}
+.event-log-backup .event-log-message {
+    color: #0b5a8a;
+}
+
+.event-log-backup-error {
+    background: #fff0f0;
+}
+.event-log-backup-error .event-log-message {
+    color: #a12a2a;
+}

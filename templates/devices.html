@@ -46,6 +46,8 @@
         </select>
         <button onclick="probeDevices()" class="button" style="margin-left:15px;">🔍 Probe Devices</button>
         <button onclick="loadDevices()" class="button" style="margin-left:5px;">🔄 Refresh</button>
+        <button onclick="backupSelected()" id="backup-btn" class="button" style="margin-left:15px;" disabled>💾 Backup Selected (0)</button>
+        <span id="backup-status" class="backup-status"></span>
         <button onclick="clearDevices()" class="button button-danger" style="margin-left:15px;">🗑 Clear All Devices</button>
         <span id="probe-status" style="margin-left:10px; font-size:13px; color:#666;"></span>
     </div>
@@ -58,7 +60,7 @@
     <!-- Event Log -->
     <h2 class="title" style="background: #7D8EE2">Event Log</h2>
     <p style="text-align:center; font-size:13px; color:#666; margin-bottom:10px;">
-        Live events from UDP device broadcasts. Updates in real time.
+        Live events from UDP device broadcasts and backups. Updates in real time.
     </p>
     <div class="event-log-container" id="event-log-container">
         <div id="event-log">
@@ -99,6 +101,9 @@
 
     <script>
     let autoRefreshInterval = null;
+    let backupPollTimer = null;
+    let backupRunning = false;
+    const selectedMacs = new Set();
 
     // ---- Load Devices ----
     function loadDevices() {
@@ -144,6 +149,7 @@
         let html = '<div class="devices-table-wrapper">';
         html += '<table class="scan device-table">';
         html += '<thead><tr>';
+        html += '<th class="select-col"><input type="checkbox" id="select-all" title="Select all visible"></th>';
         html += '<th class="device-policy-col" title="Разрешить автообновление файловой системы">Обновление ФС</th>';
         html += '<th class="device-policy-col" title="Разрешить автообновление прошивки">Обновление прошивки</th>';
         visibleFields.forEach(field => {
@@ -152,7 +158,10 @@
         html += '</tr></thead><tbody>';
 
         devices.forEach(dev => {
-            html += '<tr>';
+            const checked = selectedMacs.has(dev.mac);
+            html += '<tr' + (checked ? ' class="selected-row"' : '') + '>';
+            html += '<td class="select-col"><input type="checkbox" class="row-select" data-mac="' +
+                    escapeHtml(dev.mac || '') + '"' + (checked ? ' checked' : '') + '></td>';
             html += '<td class="device-policy-col">'
                  + '<input type="checkbox" class="update-policy-cb" data-mac="' + dev.mac + '" data-field="fs"'
                  + (dev.allowFsUpdate ? ' checked' : '')
@@ -184,6 +193,8 @@
         html += '</tbody></table>';
         html += '</div>';
         container.innerHTML = html;
+        updateSelectAllState();
+        updateBackupButton();
     }
 
     // ---- Format Time ----
@@ -206,6 +217,131 @@
         } catch(e) {
             return isoStr;
         }
+    }
+
+    // ---- Selection ----
+    function updateSelectAllState() {
+        const boxes = document.querySelectorAll('.row-select');
+        const checked = document.querySelectorAll('.row-select:checked');
+        const selectAll = document.getElementById('select-all');
+        if (!selectAll) return;
+        selectAll.checked = boxes.length > 0 && checked.length === boxes.length;
+        selectAll.indeterminate = checked.length > 0 && checked.length < boxes.length;
+    }
+
+    function updateBackupButton() {
+        const btn = document.getElementById('backup-btn');
+        if (!btn) return;
+        btn.textContent = '💾 Backup Selected (' + selectedMacs.size + ')';
+        btn.disabled = selectedMacs.size === 0 || backupRunning;
+    }
+
+    function setBackupStatus(text) {
+        const el = document.getElementById('backup-status');
+        if (el) el.textContent = text || '';
+    }
+
+    function handleSelectionChange(event) {
+        const target = event.target;
+        if (!target || !target.classList) return;
+
+        if (target.id === 'select-all') {
+            const checked = target.checked;
+            document.querySelectorAll('.row-select').forEach(box => {
+                box.checked = checked;
+                const mac = box.dataset.mac;
+                if (checked) selectedMacs.add(mac); else selectedMacs.delete(mac);
+                const row = box.closest('tr');
+                if (row) row.classList.toggle('selected-row', checked);
+            });
+            updateSelectAllState();
+            updateBackupButton();
+            return;
+        }
+
+        if (target.classList.contains('row-select')) {
+            const mac = target.dataset.mac;
+            if (target.checked) selectedMacs.add(mac); else selectedMacs.delete(mac);
+            const row = target.closest('tr');
+            if (row) row.classList.toggle('selected-row', target.checked);
+            updateSelectAllState();
+            updateBackupButton();
+        }
+    }
+
+    // ---- Backup ----
+    function renderBackupStatus(state) {
+        if (!state) return;
+        if (state.running) {
+            const current = state.current ? ' — ' + state.current : '';
+            setBackupStatus('Backup: ' + state.done + '/' + state.total + current);
+            return;
+        }
+        if (state.finishedAt) {
+            const results = state.results || [];
+            const ok = results.filter(item => item.ok).length;
+            const failed = results.length - ok;
+            let text = 'Backup finished: ' + ok + ' ok';
+            if (failed > 0) text += ', ' + failed + ' error(s)';
+            if (state.error) text += ' (' + state.error + ')';
+            setBackupStatus(text);
+        }
+    }
+
+    function pollBackupStatus() {
+        fetch('/api/devices/backup/status', { cache: 'no-store' })
+        .then(r => r.json())
+        .then(data => {
+            const state = data.state || data;
+            backupRunning = !!state.running;
+            renderBackupStatus(state);
+            updateBackupButton();
+            if (!backupRunning && backupPollTimer) {
+                clearInterval(backupPollTimer);
+                backupPollTimer = null;
+            } else if (backupRunning && !backupPollTimer) {
+                backupPollTimer = setInterval(pollBackupStatus, 1000);
+            }
+        })
+        .catch(err => {
+            console.error('Backup status error:', err);
+        });
+    }
+
+    function startBackupPolling() {
+        if (backupPollTimer) return;
+        backupPollTimer = setInterval(pollBackupStatus, 1000);
+        pollBackupStatus();
+    }
+
+    function backupSelected() {
+        if (selectedMacs.size === 0 || backupRunning) return;
+
+        backupRunning = true;
+        updateBackupButton();
+        setBackupStatus('Starting backup...');
+
+        fetch('/api/devices/backup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ macs: Array.from(selectedMacs) })
+        })
+        .then(async response => {
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || ('HTTP ' + response.status));
+            }
+            return data;
+        })
+        .then(data => {
+            setBackupStatus('Backup started: ' + (data.total || selectedMacs.size) + ' device(s)');
+            startBackupPolling();
+        })
+        .catch(err => {
+            backupRunning = false;
+            updateBackupButton();
+            setBackupStatus('Backup error: ' + err.message);
+        });
     }
 
     // ---- Probe Devices ----
@@ -315,6 +451,8 @@
         .then(r => r.json())
         .then(data => {
             if (data.success) {
+                selectedMacs.clear();
+                updateBackupButton();
                 loadDevices();
                 document.getElementById('event-log').innerHTML =
                     '<div class="event-log-empty">All devices cleared.</div>';
@@ -399,6 +537,12 @@
             typeClass = 'event-log-created';
         } else if (eventData.type === 'devices_cleared') {
             typeClass = 'event-log-cleared';
+        } else if (eventData.type === 'backup_started' || eventData.type === 'backup_finished') {
+            typeClass = 'event-log-backup';
+        } else if (eventData.type === 'backup_device_done') {
+            typeClass = eventData.ok ? 'event-log-backup' : 'event-log-backup-error';
+        } else if (eventData.type === 'backup_progress') {
+            typeClass = 'event-log-backup';
         }
 
         const entry = document.createElement('div');
@@ -438,9 +582,13 @@
 
     // ---- Init ----
     document.addEventListener('DOMContentLoaded', function() {
+        document.getElementById('devices-container')
+            .addEventListener('change', handleSelectionChange);
         loadDevices();
         startAutoRefresh();
         setupEventSource();
+        updateBackupButton();
+        pollBackupStatus();
     });
     </script>
 </body>

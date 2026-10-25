@@ -12,6 +12,14 @@
         }
     ],
     "manifest_path": "/manifest.json",
+    "device_username": "",
+    "device_password": "",
+    "backup": {
+        "dir": "./backups",
+        "timeout_s": 10,
+        "inter_request_delay_ms": 150,
+        "extra_config_files": []
+    },
     "udp_listener": {
         "is_listening": true,
         "receive_port": 40000,

@@ -3,8 +3,9 @@
 ## Назначение
 
 Python-проект: **хостинг прошивок** и **сбор телеметрии** ESP-устройств по UDP.
-Входит в экосистему `avr-fota`, но живёт в **собственном git-репозитории**
-(корень — этот каталог, `D:\github\avr-fota\otasyncer-server`).
+Входит в экосистему `avr-fota` и является **главным и единственным** репозиторием
+сервера (корень — этот каталог, `D:\github\avr-fota\otasyncer-server`). Отдельные
+клоны вне `avr-fota` не использовать и не синхронизировать.
 
 - Устройства шлют UDP-broadcast с JSON-телеметрией (`DeviceInfo`, ключ записи — `mac`);
 - Веб-интерфейс показывает онлайн-устройства, события и файлы прошивок;
@@ -23,7 +24,8 @@ python app.py
 - Manifest для устройств: `/manifest.json?target=<BUILD_ENV>&ver=<версия>`
 - UDP: receive `40000`, transmit `40001`, ключевое слово по умолчанию `Ave_Omnissiah`
 
-Настройки — в `config.json`; данные об устройствах — в `devices_db.json`
+Настройки — в `config.json` (UDP, логирование, `backup`, `device_username` /
+`device_password`); данные об устройствах — в `devices_db.json`
 (пересоздаются автоматически); колонки таблицы — в `display_format.json`.
 `firmware_dirs` указывает на каталоги с `.bin`-файлами прошивок (второй каталог
 обычно `D:\github\avr-fota\proj_fwbins` — сюда PlatformIO складывает собранные
@@ -39,6 +41,7 @@ python app.py
 | `SseManager` | Рассылка событий браузерам по Server-Sent Events (`/api/events`) |
 | `UdpListener` | Фоновый поток: приём UDP-broadcast, разбор JSON, обновление устройств; probe/super-broadcast по кнопке |
 | `manifest()` | Формирует `/manifest.json` под конкретное устройство с учётом его политики обновлений |
+| `_backup_worker` / `_backup_one_device` | Фоновый последовательный бэкап конфигов и Lua-скриптов выбранных устройств |
 | Утилиты прошивок | `scan_firmware_files`, парсинг имён `{env}-{FIRMWARE|FILESYS}-{MAJOR}.{MINOR}.{DATE}_{TIME}.{BUILD}.bin`, удаление старых версий |
 
 Периодическая задача (раз в минуту) помечает устройства офлайн
@@ -73,12 +76,36 @@ python app.py
 Управление политикой: `POST /api/device/<mac>/update-policy`
 с частичным JSON `{"allowFwUpdate": bool, "allowFsUpdate": bool}`.
 
+## Бэкап конфигов и скриптов
+
+В таблице `/devices` можно выделить одно или несколько устройств и нажать
+**Backup Selected**. Сервер в фоне, строго последовательно заходит на каждое
+устройство по HTTP и выгружает:
+
+- JSON-конфиги (`config_*.json`, `secret.json`, `_version_fs.json`,
+  `avrisp_cfg.json`, `avrisp.json`, `swd_cfg.json`, `/macros/resources.json`);
+- Lua-скрипты `/macros/*.lua` (список берётся из `/macros/list`);
+- `meta.json` с версиями устройства, списком файлов, SHA-256 и ошибками.
+
+Папка: `backups/<devicename>_<serial>/` (например `esp32_D2A58`); повторный
+успешный бэкап заменяет её содержимое. При ошибках существующая папка не
+перезаписывается. HTML-страницы, JS/CSS, картинки и шрифты не выгружаются;
+HTML-ответ 404 от ESP (с кодом 200) распознаётся и игнорируется.
+
+- `POST /api/devices/backup` — тело `{"macs": ["..."]}`, запуск задания (202);
+  повторный запуск во время работы → 409;
+- `GET /api/devices/backup/status` — состояние и результаты;
+- настройки — `backup` в `config.json` (`dir`, `timeout_s`,
+  `inter_request_delay_ms`, `extra_config_files`);
+- необязательные `device_username` / `device_password` — HTTP Basic для устройств.
+
 ## Ключевые HTTP-эндпоинты
 
 - `GET /manifest.json` — манифест для OTA-клиента (см. выше)
 - `GET /firmware/<filename>` — скачивание бинарника
 - `POST /upload`, `POST /delete/<filename>` — загрузка/удаление файлов прошивок
 - `GET/POST /api/devices`, `GET /api/device/<mac>`, `POST /api/device/<mac>/update-policy`
+- `POST /api/devices/backup`, `GET /api/devices/backup/status` — бэкап конфигов/скриптов
 - `POST /api/devices/clear` — очистить список устройств (сбрасывает и политики)
 - `GET /api/events` (SSE), `GET /api/events/log`
 - `POST /api/udp/probe` — broadcast-запрос к устройствам
@@ -89,7 +116,7 @@ python app.py
 - Код — Python + Flask (WSGI, один файл `app.py`), комментарии на русском.
 - Веб-интерфейс: шаблоны Jinja2 в `templates/`, стили в `static/`.
 - Конфиг/БД/формат — JSON-файлы рядом с `app.py`, секретов в репозиторий не класть.
-- Изменения коммитить в этот репозиторий (`otasyncer-server`), а не в `avr-fota`.
+- Изменения коммитить только в этот репозиторий (`D:\github\avr-fota\otasyncer-server`), а не в `avr-fota`.
 - Проверка перед коммитом:
   ```bash
   python -m py_compile app.py
