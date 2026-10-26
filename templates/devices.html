@@ -54,7 +54,14 @@
 
     <!-- Devices Table -->
     <div id="devices-container">
-        <p style="text-align:center; color:#666; margin:20px 0;">Loading devices...</p>
+        <div class="devices-table-wrapper" id="devices-wrapper">
+            <table class="scan device-table">
+                <thead id="devices-thead"></thead>
+                <tbody id="devices-tbody">
+                    <tr><td class="devices-empty-cell" colspan="3">Loading devices...</td></tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <!-- Event Log -->
@@ -105,8 +112,26 @@
     let backupRunning = false;
     const selectedMacs = new Set();
 
+    // Каркас таблицы статический: обновляем только thead/tbody, поэтому
+    // горизонтальная прокрутка wrapper'а не сбрасывается.
+    let lastColumnsSignature = null;
+    let devicesFetchInFlight = false;
+    let devicesFetchPending = false;
+    let devicesReloadTimer = null;
+    const DEVICES_RELOAD_DELAY_MS = 400;
+
+    const COL_LABELS = {};
+    {% for col in display_format.columns %}
+    COL_LABELS['{{ col.field }}'] = '{{ col.label }}';
+    {% endfor %}
+
     // ---- Load Devices ----
     function loadDevices() {
+        if (devicesFetchInFlight) {
+            devicesFetchPending = true;
+            return;
+        }
+        devicesFetchInFlight = true;
         const minutes = document.getElementById('time-filter').value;
         fetch('/api/devices?minutes=' + minutes)
         .then(r => r.json())
@@ -117,84 +142,134 @@
             document.getElementById('offline-count').textContent = data.total - data.online;
         })
         .catch(err => {
-            document.getElementById('devices-container').innerHTML =
-                '<p style="text-align:center; color:red; margin:20px 0;">Error loading devices: ' + err + '</p>';
+            renderDevicesError(err);
+        })
+        .finally(() => {
+            devicesFetchInFlight = false;
+            if (devicesFetchPending) {
+                devicesFetchPending = false;
+                scheduleDevicesReload(0);
+            }
         });
     }
 
-    // ---- Render Devices Table ----
-    function renderDevices(devices) {
-        const container = document.getElementById('devices-container');
+    // Схлопывание потока событий от SSE/probe: не чаще одного запроса
+    // за интервал, но без «голодания» — данные доезжают до таблицы.
+    function scheduleDevicesReload(delay) {
+        const wait = typeof delay === 'number' ? delay : DEVICES_RELOAD_DELAY_MS;
+        if (devicesReloadTimer) return;
+        devicesReloadTimer = setTimeout(function() {
+            devicesReloadTimer = null;
+            loadDevices();
+        }, wait);
+    }
 
-        if (devices.length === 0) {
-            container.innerHTML = '<p style="text-align:center; color:#666; margin:20px 0;">No devices found. Wait for UDP broadcasts or click "Probe Devices".</p>';
-            return;
-        }
-
-        // Get visible columns
-        const checkboxes = document.querySelectorAll('.col-checkbox');
-        const visibleFields = [];
-        checkboxes.forEach(cb => {
-            if (cb.checked) {
-                visibleFields.push(cb.dataset.field);
-            }
+    // ---- Visible Columns / Table Header ----
+    function getVisibleFields() {
+        const fields = [];
+        document.querySelectorAll('.col-checkbox').forEach(cb => {
+            if (cb.checked) fields.push(cb.dataset.field);
         });
+        return fields;
+    }
 
-        // Column labels
-        const colLabels = {};
-        {% for col in display_format.columns %}
-        colLabels['{{ col.field }}'] = '{{ col.label }}';
-        {% endfor %}
+    function renderHeader(visibleFields) {
+        const thead = document.getElementById('devices-thead');
+        if (!thead) return;
 
-        let html = '<div class="devices-table-wrapper">';
-        html += '<table class="scan device-table">';
-        html += '<thead><tr>';
+        const columnsSignature = visibleFields.join('|');
+        if (columnsSignature === lastColumnsSignature) return;
+
+        let html = '<tr>';
         html += '<th class="select-col"><input type="checkbox" id="select-all" title="Select all visible"></th>';
         html += '<th class="device-policy-col" title="Разрешить автообновление файловой системы">Обновление ФС</th>';
         html += '<th class="device-policy-col" title="Разрешить автообновление прошивки">Обновление прошивки</th>';
         visibleFields.forEach(field => {
-            html += '<th>' + (colLabels[field] || field) + '</th>';
+            html += '<th>' + (COL_LABELS[field] || field) + '</th>';
         });
-        html += '</tr></thead><tbody>';
+        html += '</tr>';
 
-        devices.forEach(dev => {
-            const checked = selectedMacs.has(dev.mac);
-            html += '<tr' + (checked ? ' class="selected-row"' : '') + '>';
-            html += '<td class="select-col"><input type="checkbox" class="row-select" data-mac="' +
-                    escapeHtml(dev.mac || '') + '"' + (checked ? ' checked' : '') + '></td>';
-            html += '<td class="device-policy-col">'
-                 + '<input type="checkbox" class="update-policy-cb" data-mac="' + dev.mac + '" data-field="fs"'
-                 + (dev.allowFsUpdate ? ' checked' : '')
-                 + ' title="Разрешить автообновление файловой системы" onchange="setUpdatePolicy(this)">'
-                 + '</td>';
-            html += '<td class="device-policy-col">'
-                 + '<input type="checkbox" class="update-policy-cb" data-mac="' + dev.mac + '" data-field="fw"'
-                 + (dev.allowFwUpdate ? ' checked' : '')
-                 + ' title="Разрешить автообновление прошивки" onchange="setUpdatePolicy(this)">'
-                 + '</td>';
-            visibleFields.forEach(field => {
-                let value = '';
-                if (field === 'status') {
-                    value = dev.isOnline
-                        ? '<span class="status-indicator status-online" title="Online">●</span>'
-                        : '<span class="status-indicator status-offline" title="Offline">●</span>';
-                } else if (field === 'lastSeen') {
-                    value = formatTime(dev.lastSeen);
-                } else if (field === 'ip' && dev.ip) {
-                    value = '<a href="http://' + dev.ip + '" target="_blank" rel="noopener noreferrer">' + dev.ip + '</a>';
-                } else {
-                    value = dev[field] || '';
-                }
-                html += '<td>' + value + '</td>';
+        thead.innerHTML = html;
+        lastColumnsSignature = columnsSignature;
+    }
+
+    // ---- Render Devices Table ----
+    function renderDevices(devices) {
+        const wrapper = document.getElementById('devices-wrapper');
+        const tbody = document.getElementById('devices-tbody');
+        if (!wrapper || !tbody) return;
+
+        const visibleFields = getVisibleFields();
+        renderHeader(visibleFields);
+
+        const columnsCount = 3 + visibleFields.length;
+        const scrollLeft = wrapper.scrollLeft;
+        const scrollTop = wrapper.scrollTop;
+
+        let html = '';
+        if (devices.length === 0) {
+            html = '<tr><td class="devices-empty-cell" colspan="' + columnsCount + '">'
+                 + 'No devices found. Wait for UDP broadcasts or click "Probe Devices".'
+                 + '</td></tr>';
+        } else {
+            devices.forEach(dev => {
+                const checked = selectedMacs.has(dev.mac);
+                html += '<tr' + (checked ? ' class="selected-row"' : '') + '>';
+                html += '<td class="select-col"><input type="checkbox" class="row-select" data-mac="' +
+                        escapeHtml(dev.mac || '') + '"' + (checked ? ' checked' : '') + '></td>';
+                html += '<td class="device-policy-col">'
+                     + '<input type="checkbox" class="update-policy-cb" data-mac="' + dev.mac + '" data-field="fs"'
+                     + (dev.allowFsUpdate ? ' checked' : '')
+                     + ' title="Разрешить автообновление файловой системы" onchange="setUpdatePolicy(this)">'
+                     + '</td>';
+                html += '<td class="device-policy-col">'
+                     + '<input type="checkbox" class="update-policy-cb" data-mac="' + dev.mac + '" data-field="fw"'
+                     + (dev.allowFwUpdate ? ' checked' : '')
+                     + ' title="Разрешить автообновление прошивки" onchange="setUpdatePolicy(this)">'
+                     + '</td>';
+                visibleFields.forEach(field => {
+                    let value = '';
+                    if (field === 'status') {
+                        value = dev.isOnline
+                            ? '<span class="status-indicator status-online" title="Online">●</span>'
+                            : '<span class="status-indicator status-offline" title="Offline">●</span>';
+                    } else if (field === 'lastSeen') {
+                        value = formatTime(dev.lastSeen);
+                    } else if (field === 'ip' && dev.ip) {
+                        value = '<a href="http://' + dev.ip + '" target="_blank" rel="noopener noreferrer">' + dev.ip + '</a>';
+                    } else {
+                        value = dev[field] || '';
+                    }
+                    html += '<td>' + value + '</td>';
+                });
+                html += '</tr>';
             });
-            html += '</tr>';
-        });
+        }
 
-        html += '</tbody></table>';
-        html += '</div>';
-        container.innerHTML = html;
+        tbody.innerHTML = html;
+
+        // Возвращаем прокрутку (браузер ограничит по фактической ширине таблицы).
+        wrapper.scrollLeft = scrollLeft;
+        wrapper.scrollTop = scrollTop;
+
         updateSelectAllState();
         updateBackupButton();
+    }
+
+    function renderDevicesError(err) {
+        const wrapper = document.getElementById('devices-wrapper');
+        const tbody = document.getElementById('devices-tbody');
+        if (!tbody) return;
+
+        const visibleFields = getVisibleFields();
+        renderHeader(visibleFields);
+
+        const columnsCount = 3 + visibleFields.length;
+        const scrollLeft = wrapper ? wrapper.scrollLeft : 0;
+        const message = err && err.message ? err.message : String(err);
+        tbody.innerHTML = '<tr><td class="devices-empty-cell devices-error-cell" colspan="' + columnsCount + '">'
+                        + 'Error loading devices: ' + escapeHtml(message) + '</td></tr>';
+        if (wrapper) wrapper.scrollLeft = scrollLeft;
     }
 
     // ---- Format Time ----
@@ -357,7 +432,7 @@
             if (data.success) {
                 status.textContent = 'Probe sent (' + data.sent_count + ' packets). Waiting for responses...';
                 setTimeout(() => {
-                    loadDevices();
+                    scheduleDevicesReload(0);
                     status.textContent = '';
                 }, 3000);
             } else {
@@ -495,12 +570,13 @@
                 const eventData = JSON.parse(e.data);
                 addLogEntry(eventData, true);
                 // При получении события от устройства — обновляем таблицу
+                // (батчинг: не чаще одного запроса за интервал, прокрутка не сбрасывается)
                 if (eventData.type === 'device_created' || eventData.type === 'device_updated') {
-                    loadDevices();
+                    scheduleDevicesReload();
                 }
                 // При очистке — тоже обновляем таблицу
                 if (eventData.type === 'devices_cleared') {
-                    loadDevices();
+                    scheduleDevicesReload();
                 }
             } catch(err) {
                 console.error('SSE parse error:', err);

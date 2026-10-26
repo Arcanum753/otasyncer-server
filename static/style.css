@@ -519,6 +519,16 @@ iframe {
     padding: 4px 6px;
     white-space: nowrap;
 }
+/* Empty/error placeholder as a table row: table and its scrollbar stay in place */
+.device-table td.devices-empty-cell {
+    text-align: center;
+    color: #666;
+    padding: 16px;
+    white-space: normal;
+}
+.device-table td.devices-error-cell {
+    color: #c00;
+}
 /* Update policy columns (FS / Firmware checkboxes per device row) */
 .device-policy-col {
     text-align: center;
