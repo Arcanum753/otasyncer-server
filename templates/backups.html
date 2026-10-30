@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OTA Server — Backups</title>
+    <meta http-equiv="Content-type" content="text/html; charset=utf-8">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .bk-toolbar { text-align: center; margin: 10px; }
+        .bk-toolbar input, .bk-toolbar select { margin: 0 4px; }
+        .bk-table { width: 96%; margin: 10px auto; border-collapse: collapse; }
+        .bk-table th, .bk-table td { border-bottom: 1px solid #ddd; padding: 6px; font-size: 13px; text-align: left; }
+        .bk-table td.num { text-align: right; }
+        .bk-table tr.broken { color: #b00020; }
+        .bk-actions button { margin: 0 2px; }
+        .bk-status { text-align: center; min-height: 20px; margin: 8px; color: #666; }
+        .bk-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 20; }
+        .bk-modal .box { background: #fff; width: min(900px, 94vw); max-height: 84vh; overflow: auto; margin: 6vh auto; padding: 16px; border-radius: 6px; }
+        .bk-modal h3 { margin-top: 0; }
+        .bk-files { width: 100%; border-collapse: collapse; }
+        .bk-files td, .bk-files th { border-bottom: 1px solid #eee; padding: 4px; font-size: 12px; text-align: left; }
+    </style>
+</head>
+<body>
+    <h3 class="top">OTA Server.<sup>&copy;</sup></h3>
+    <div class="menu">
+        <div>
+            <a href="/">Main</a>
+            <a href="/devices">Devices</a>
+            <a href="/backups" class="active">Backups</a>
+            <a href="/udp-settings">UDP Settings</a>
+        </div>
+    </div>
+
+    <h2 class="title" style="background: #7D8EE2">Device Backups</h2>
+    <p style="text-align:center; font-size:13px; color:#666;">
+        Versioned snapshots. Each snapshot is a plain folder of files; no ZIP archives are stored.
+    </p>
+
+    <div class="bk-toolbar">
+        <select id="bk-kind" onchange="loadBackups()">
+            <option value="">All kinds</option>
+            <option value="manual">Manual</option>
+            <option value="fs_update">FS update</option>
+        </select>
+        <input type="text" id="bk-filter" placeholder="Filter device / MAC / id" oninput="renderBackups()">
+        <button onclick="loadBackups()" class="button">Refresh</button>
+        <button onclick="deleteSelected()" class="button button-danger">Delete selected</button>
+        <span id="bk-status" class="bk-status"></span>
+    </div>
+
+    <table class="bk-table">
+        <thead>
+            <tr>
+                <th><input type="checkbox" id="bk-all" onchange="toggleAll(this.checked)"></th>
+                <th>Device</th><th>MAC</th><th>Kind</th><th>Created</th>
+                <th>FW</th><th>FS</th><th>Files</th><th>Size</th><th>Warn/Err</th><th>Actions</th>
+            </tr>
+        </thead>
+        <tbody id="bk-tbody">
+            <tr><td colspan="11" style="text-align:center;color:#888">Loading...</td></tr>
+        </tbody>
+    </table>
+
+    <div class="bk-modal" id="bk-modal" onclick="if(event.target===this)closeView()">
+        <div class="box">
+            <h3 id="bk-view-title">Snapshot</h3>
+            <div id="bk-view-meta"></div>
+            <table class="bk-files">
+                <thead><tr><th>Device path</th><th>Size</th><th>SHA-256</th><th></th></tr></thead>
+                <tbody id="bk-view-files"></tbody>
+            </table>
+            <p style="text-align:right"><button class="button" onclick="closeView()">Close</button></p>
+        </div>
+    </div>
+
+    <footer>
+        <div class="footer">OTA Firmware Server — Backups</div>
+        <div class="copyright">(c) 2025 OTA Server</div>
+    </footer>
+
+    <script>
+    let backups = [];
+    let viewId = null;
+    const selected = new Set();
+
+    function setStatus(text) {
+        document.getElementById('bk-status').textContent = text || '';
+    }
+
+    function fmtSize(n) {
+        n = Number(n) || 0;
+        if (n < 1024) return n + ' B';
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+        return (n / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
+    function fmtTime(t) {
+        if (!t) return '-';
+        const d = new Date(t);
+        return isNaN(d.getTime()) ? String(t) : d.toLocaleString();
+    }
+
+    function deviceLabel(b) {
+        const d = b.device || {};
+        return d.name || d.serial || b.deviceKey || '-';
+    }
+
+    async function loadBackups() {
+        try {
+            setStatus('Loading...');
+            const kind = document.getElementById('bk-kind').value;
+            const r = await fetch('/api/backups' + (kind ? '?kind=' + encodeURIComponent(kind) : ''), { cache: 'no-store' });
+            const data = await r.json();
+            if (!r.ok || !data.success) throw new Error(data.error || ('HTTP ' + r.status));
+            backups = data.backups || [];
+            selected.clear();
+            document.getElementById('bk-all').checked = false;
+            renderBackups();
+            setStatus(backups.length + ' snapshot(s)');
+        } catch (e) {
+            setStatus('Error: ' + e.message);
+        }
+    }
+
+    function renderBackups() {
+        const tbody = document.getElementById('bk-tbody');
+        tbody.innerHTML = '';
+        const filter = (document.getElementById('bk-filter').value || '').toLowerCase();
+        const list = backups.filter(b => {
+            if (!filter) return true;
+            const hay = [b.id, b.deviceKey, (b.device || {}).name, (b.device || {}).serial, (b.device || {}).mac]
+                .join(' ').toLowerCase();
+            return hay.indexOf(filter) >= 0;
+        });
+        if (!list.length) {
+            tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#888">No snapshots</td></tr>';
+            return;
+        }
+        for (const b of list) {
+            const tr = document.createElement('tr');
+            if (b.broken) tr.className = 'broken';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = selected.has(b.id);
+            cb.onchange = () => { if (cb.checked) selected.add(b.id); else selected.delete(b.id); };
+            const td0 = document.createElement('td'); td0.appendChild(cb); tr.appendChild(td0);
+
+            const d = b.device || {};
+            const cells = [deviceLabel(b), d.mac || '-', b.kind || '-', fmtTime(b.createdAt),
+                           b.fwVersion || '-', b.fsVersion || '-', b.files, fmtSize(b.bytes),
+                           (b.warnings || 0) + ' / ' + (b.errors || 0)];
+            for (let i = 0; i < cells.length; i++) {
+                const td = document.createElement('td');
+                if (i === 6) td.className = 'num';
+                td.textContent = cells[i];
+                tr.appendChild(td);
+            }
+
+            const tdAct = document.createElement('td');
+            tdAct.className = 'bk-actions';
+            const view = document.createElement('button'); view.textContent = 'View';
+            view.onclick = () => viewSnapshot(b.id); tdAct.appendChild(view);
+            const restore = document.createElement('button'); restore.textContent = 'Restore';
+            restore.onclick = () => restoreSnapshot(b.id); tdAct.appendChild(restore);
+            const del = document.createElement('button'); del.textContent = 'Delete';
+            del.onclick = () => deleteSnapshot(b.id); tdAct.appendChild(del);
+            tr.appendChild(tdAct);
+            tbody.appendChild(tr);
+        }
+    }
+
+    function toggleAll(checked) {
+        selected.clear();
+        if (checked) backups.forEach(b => selected.add(b.id));
+        renderBackups();
+    }
+
+    async function viewSnapshot(id) {
+        try {
+            const r = await fetch('/api/backups/' + id, { cache: 'no-store' });
+            const data = await r.json();
+            if (!r.ok || !data.success) throw new Error(data.error || ('HTTP ' + r.status));
+            viewId = id;
+            const meta = data.meta || {};
+            const d = meta.device || {};
+            document.getElementById('bk-view-title').textContent = id;
+            document.getElementById('bk-view-meta').innerHTML =
+                '<p><b>Device:</b> ' + (d.name || '-') + ' (' + (d.mac || '-') + ')<br>' +
+                '<b>Kind:</b> ' + (meta.kind || '-') + '<br>' +
+                '<b>Created:</b> ' + fmtTime(meta.createdAt) + '<br>' +
+                '<b>FW / FS:</b> ' + (d.versionapp || '-') + ' / ' + (d.versionfs || '-') + '</p>' +
+                '<p><b>Warnings:</b> ' + (meta.warnings || []).length +
+                ' &nbsp; <b>Errors:</b> ' + (meta.errors || []).length + '</p>';
+            const tb = document.getElementById('bk-view-files');
+            tb.innerHTML = '';
+            for (const f of (meta.files || [])) {
+                const tr = document.createElement('tr');
+                const tdPath = document.createElement('td'); tdPath.textContent = f.devicePath || f.path || '';
+                const tdSize = document.createElement('td'); tdSize.textContent = fmtSize(f.size);
+                const tdSha = document.createElement('td'); tdSha.textContent = (f.sha256 || '').slice(0, 16);
+                const tdA = document.createElement('td');
+                const a = document.createElement('a');
+                a.href = '/api/backups/' + id + '/file?path=' + encodeURIComponent(f.devicePath || f.path || '');
+                a.textContent = 'Download';
+                tdA.appendChild(a);
+                tr.appendChild(tdPath); tr.appendChild(tdSize); tr.appendChild(tdSha); tr.appendChild(tdA);
+                tb.appendChild(tr);
+            }
+            document.getElementById('bk-modal').style.display = 'block';
+        } catch (e) {
+            setStatus('View failed: ' + e.message);
+        }
+    }
+
+    function closeView() {
+        viewId = null;
+        document.getElementById('bk-modal').style.display = 'none';
+    }
+
+    async function restoreSnapshot(id) {
+        if (!confirm('Restore snapshot ' + id + ' to its device?')) return;
+        try {
+            const r = await fetch('/api/backups/' + id + '/restore', { method: 'POST' });
+            const data = await r.json();
+            if (!r.ok || !data.success) throw new Error(data.error || ('HTTP ' + r.status));
+            setStatus('Restore started');
+            pollRestore();
+        } catch (e) {
+            setStatus('Restore failed: ' + e.message);
+        }
+    }
+
+    function pollRestore() {
+        const t = setInterval(async () => {
+            try {
+                const r = await fetch('/api/backups/restore/status', { cache: 'no-store' });
+                const data = await r.json();
+                const st = data.state || {};
+                setStatus('Restore: ' + (st.current || '...') + (st.running ? ' (running)' : ' (done)'));
+                if (!st.running) clearInterval(t);
+            } catch (e) { clearInterval(t); }
+        }, 1500);
+    }
+
+    async function deleteSnapshot(id) {
+        if (!confirm('Delete snapshot ' + id + '?')) return;
+        try {
+            const r = await fetch('/api/backups/' + id, { method: 'DELETE' });
+            const data = await r.json();
+            if (!r.ok || !data.success) throw new Error(data.error || ('HTTP ' + r.status));
+            setStatus('Deleted ' + id);
+            await loadBackups();
+        } catch (e) {
+            setStatus('Delete failed: ' + e.message);
+        }
+    }
+
+    async function deleteSelected() {
+        if (!selected.size) return;
+        if (!confirm('Delete ' + selected.size + ' snapshot(s)?')) return;
+        try {
+            const r = await fetch('/api/backups/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids: Array.from(selected) })
+            });
+            const data = await r.json();
+            if (!r.ok || !data.success) throw new Error(data.error || ('HTTP ' + r.status));
+            setStatus('Deleted: ' + (data.deleted || []).length);
+            await loadBackups();
+        } catch (e) {
+            setStatus('Delete failed: ' + e.message);
+        }
+    }
+
+    window.addEventListener('load', loadBackups);
+    </script>
+</body>
+</html>

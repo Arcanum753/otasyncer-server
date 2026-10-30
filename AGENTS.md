@@ -76,28 +76,48 @@ python app.py
 Управление политикой: `POST /api/device/<mac>/update-policy`
 с частичным JSON `{"allowFwUpdate": bool, "allowFsUpdate": bool}`.
 
-## Бэкап конфигов и скриптов
+## Версионные бэкапы (snapshots)
 
-В таблице `/devices` можно выделить одно или несколько устройств и нажать
-**Backup Selected**. Сервер в фоне, строго последовательно заходит на каждое
-устройство по HTTP и выгружает:
+Нужна прошивка с `core_fs` (`/fs/info`, `api == 1`). Старые прошивки без него и
+старая раскладка `backups/<device>/` **не поддерживаются** (прототип, обратной
+совместимости нет).
 
-- JSON-конфиги (`config_*.json`, `secret.json`, `_version_fs.json`,
-  `avrisp_cfg.json`, `avrisp.json`, `swd_cfg.json`, `/macros/resources.json`);
-- Lua-скрипты `/macros/*.lua` (список берётся из `/macros/list`);
-- `meta.json` с версиями устройства, списком файлов, SHA-256 и ошибками.
+В таблице `/devices` выделить устройства и нажать **Backup Selected**. Сервер
+последовательно читает `/system/version`, `/fs/info`, один `/fs/list` и качает
+только файлы из `backup.include_patterns` через `/fs/download`:
 
-Папка: `backups/<devicename>_<serial>/` (например `esp32_D2A58`); повторный
-успешный бэкап заменяет её содержимое. При ошибках существующая папка не
-перезаписывается. HTML-страницы, JS/CSS, картинки и шрифты не выгружаются;
-HTML-ответ 404 от ESP (с кодом 200) распознаётся и игнорируется.
+- `config_*.json`, `secret.json`, `macros/*.lua`, `avrisp.json`;
+- исключаются `_version_fs.json`, `*_cfg.json`, HTML/JS/CSS/шрифты/картинки;
+- SHA-256 считается на сервере; на ESP нет архивации/хеширования.
 
-- `POST /api/devices/backup` — тело `{"macs": ["..."]}`, запуск задания (202);
-  повторный запуск во время работы → 409;
-- `GET /api/devices/backup/status` — состояние и результаты;
-- настройки — `backup` в `config.json` (`dir`, `timeout_s`,
-  `inter_request_delay_ms`, `extra_config_files`);
-- необязательные `device_username` / `device_password` — HTTP Basic для устройств.
+Каждый бэкап — новая папка:
+`backups/<devicename>_<serial>__<mac6>/<YYYYMMDD_HHMMSS>_<kind>/` (+ `meta.json`,
+`schema=2`, `kind=manual|fs_update`). Файлы хранятся как есть, без ZIP.
+Retention: `backup.keep_manual`, `fs_update.keep_snapshots`.
+
+Управление: страница `/backups` (+ API):
+`GET /api/backups`, `GET /api/backups/<id>`, `GET /api/backups/<id>/file?path=`,
+`DELETE /api/backups/<id>`, `POST /api/backups/delete`, `POST /api/backups/<id>/restore`,
+`GET /api/backups/restore/status`.
+
+FS-обновление с сохранением настроек: `POST /api/devices/fs-update`
+(`{"macs":[...]}`) — snapshot → `allowFsUpdate=true/allowFwUpdate=false` →
+`/otaclient/test` (только `-FILESYS-`) + `/otaclient/update` → ожидание нового
+`versionfs` → `/fs/upload` restore → restart → возврат политик.
+Статус: `GET /api/devices/fs-update/status`; shortcut restore —
+`POST /api/devices/fs-restore`.
+
+Нагрузка: backup = 3 + N запросов, restore (size-verify) = 1 + N + 1; без
+пофайловых re-download (`backup.restore_verify=size`), `hash` — опционально.
+
+Настройки: `device_http_port`, `backup` (`dir`, `timeout_s`, `upload_timeout_s`,
+`inter_request_delay_ms`, `max_file_bytes`, `keep_manual`, `restore_verify`,
+`include_patterns`, `exclude_patterns`, `extra_config_files`), `fs_update`
+(`keep_snapshots`, `reconnect_timeout_s`, `status_poll_s`, `restart_after_restore`).
+`device_username`/`device_password` — HTTP Basic.
+
+Тесты: `tests/smoke_test.py` / `python -m pytest tests -q` (fake-device);
+реальное устройство — только `192.168.88.134` / MAC `58:2A:BD:61:89:A8`.
 
 ## Ключевые HTTP-эндпоинты
 
@@ -105,7 +125,9 @@ HTML-ответ 404 от ESP (с кодом 200) распознаётся и и�
 - `GET /firmware/<filename>` — скачивание бинарника
 - `POST /upload`, `POST /delete/<filename>` — загрузка/удаление файлов прошивок
 - `GET/POST /api/devices`, `GET /api/device/<mac>`, `POST /api/device/<mac>/update-policy`
-- `POST /api/devices/backup`, `GET /api/devices/backup/status` — бэкап конфигов/скриптов
+- `POST /api/devices/backup`, `GET /api/devices/backup/status` — versioned-снимки
+- `GET /api/backups` (+ `/<id>`, `/<id>/file`, `/<id>/restore`, delete), `/backups`
+- `POST /api/devices/fs-update`, `GET /api/devices/fs-update/status`, `POST /api/devices/fs-restore`
 - `POST /api/devices/clear` — очистить список устройств (сбрасывает и политики)
 - `GET /api/events` (SSE), `GET /api/events/log`
 - `POST /api/udp/probe` — broadcast-запрос к устройствам

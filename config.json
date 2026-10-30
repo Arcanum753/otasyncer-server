@@ -14,11 +14,24 @@
     "manifest_path": "/manifest.json",
     "device_username": "",
     "device_password": "",
+    "device_http_port": 80,
     "backup": {
         "dir": "./backups",
         "timeout_s": 10,
+        "upload_timeout_s": 30,
         "inter_request_delay_ms": 150,
+        "max_file_bytes": 1048576,
+        "keep_manual": 10,
+        "restore_verify": "size",
+        "include_patterns": ["/config_*.json", "/secret.json", "/macros/*.lua", "/avrisp.json"],
+        "exclude_patterns": ["/_version_fs.json", "/*_cfg.json"],
         "extra_config_files": []
+    },
+    "fs_update": {
+        "keep_snapshots": 5,
+        "reconnect_timeout_s": 300,
+        "status_poll_s": 3,
+        "restart_after_restore": true
     },
     "udp_listener": {
         "is_listening": true,

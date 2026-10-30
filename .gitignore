@@ -3,3 +3,4 @@
 /backups/
 /.kilo/
 /tray_error.log
+__pycache__/

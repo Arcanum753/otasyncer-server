@@ -12,6 +12,7 @@
         <div>
             <a href="/">Main</a>
             <a href="/devices" class="active">Devices</a>
+            <a href="/backups">Backups</a>
             <a href="/udp-settings">UDP Settings</a>
         </div>
     </div>
@@ -47,6 +48,9 @@
         <button onclick="probeDevices()" class="button" style="margin-left:15px;">🔍 Probe Devices</button>
         <button onclick="loadDevices()" class="button" style="margin-left:5px;">🔄 Refresh</button>
         <button onclick="backupSelected()" id="backup-btn" class="button" style="margin-left:15px;" disabled>💾 Backup Selected (0)</button>
+        <button onclick="fsUpdateSelected()" id="fs-update-btn" class="button" style="margin-left:8px;" disabled>🔄 Update FS + Keep Settings (0)</button>
+        <button onclick="fsRestoreSelected()" id="fs-restore-btn" class="button" style="margin-left:8px;" disabled>↩ Restore Settings (0)</button>
+        <a href="/backups" class="button" style="margin-left:8px; text-decoration:none;">📚 Backups</a>
         <span id="backup-status" class="backup-status"></span>
         <button onclick="clearDevices()" class="button button-danger" style="margin-left:15px;">🗑 Clear All Devices</button>
         <span id="probe-status" style="margin-left:10px; font-size:13px; color:#666;"></span>
@@ -309,6 +313,54 @@
         if (!btn) return;
         btn.textContent = '💾 Backup Selected (' + selectedMacs.size + ')';
         btn.disabled = selectedMacs.size === 0 || backupRunning;
+        const fsBtn = document.getElementById('fs-update-btn');
+        if (fsBtn) {
+            fsBtn.textContent = '🔄 Update FS + Keep Settings (' + selectedMacs.size + ')';
+            fsBtn.disabled = selectedMacs.size === 0 || backupRunning;
+        }
+        const rsBtn = document.getElementById('fs-restore-btn');
+        if (rsBtn) {
+            rsBtn.textContent = '↩ Restore Settings (' + selectedMacs.size + ')';
+            rsBtn.disabled = selectedMacs.size === 0 || backupRunning;
+        }
+    }
+
+    function _selectedJob(url, label) {
+        if (selectedMacs.size === 0 || backupRunning) return;
+        backupRunning = true;
+        updateBackupButton();
+        setBackupStatus(label + '...');
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ macs: Array.from(selectedMacs) })
+        })
+        .then(async response => {
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+            return data;
+        })
+        .then(data => {
+            setBackupStatus(label + ' started: ' + (data.total || selectedMacs.size) + ' device(s)');
+            if (url.indexOf('fs-update') >= 0) startFsUpdatePolling();
+            else if (url.indexOf('fs-restore') >= 0) startRestorePolling();
+            else startBackupPolling();
+        })
+        .catch(err => {
+            backupRunning = false;
+            updateBackupButton();
+            setBackupStatus(label + ' failed: ' + err.message);
+        });
+    }
+
+    function fsUpdateSelected() {
+        if (!confirm('Update filesystem and restore unique settings on selected device(s)?')) return;
+        _selectedJob('/api/devices/fs-update', 'FS update');
+    }
+
+    function fsRestoreSelected() {
+        if (!confirm('Restore the latest snapshot to selected device(s)?')) return;
+        _selectedJob('/api/devices/fs-restore', 'Restore');
     }
 
     function setBackupStatus(text) {
@@ -387,6 +439,34 @@
         if (backupPollTimer) return;
         backupPollTimer = setInterval(pollBackupStatus, 1000);
         pollBackupStatus();
+    }
+
+    function pollJobStatus(url, label) {
+        const timer = setInterval(() => {
+            fetch(url, { cache: 'no-store' })
+                .then(r => r.json())
+                .then(data => {
+                    const st = data.state || {};
+                    if (st.running) {
+                        setBackupStatus(label + ': ' + (st.current || '...'));
+                    } else {
+                        setBackupStatus(label + ': finished');
+                        clearInterval(timer);
+                        backupRunning = false;
+                        updateBackupButton();
+                        loadDevices();
+                    }
+                })
+                .catch(() => { clearInterval(timer); });
+        }, 1500);
+    }
+
+    function startFsUpdatePolling() {
+        pollJobStatus('/api/devices/fs-update/status', 'FS update');
+    }
+
+    function startRestorePolling() {
+        pollJobStatus('/api/backups/restore/status', 'Restore');
     }
 
     function backupSelected() {

@@ -24,6 +24,7 @@ import copy
 import re
 import shutil
 import ipaddress
+import fnmatch
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -37,9 +38,10 @@ from werkzeug.utils import secure_filename
 # ============================================================
 # Константы
 # ============================================================
-CONFIG_FILE = 'config.json'
-DEVICES_DB_FILE = 'devices_db.json'
+CONFIG_FILE = os.environ.get('OTASYNCER_CONFIG', 'config.json')
+DEVICES_DB_FILE = os.environ.get('OTASYNCER_DEVICES_DB', 'devices_db.json')
 DISPLAY_FORMAT_FILE = 'display_format.json'
+TEST_MODE = os.environ.get('OTASYNCER_TEST') == '1'
 
 # Максимальное количество записей в логе событий
 MAX_EVENT_LOG_SIZE = 200
@@ -52,11 +54,24 @@ DEFAULT_CONFIG = {
     "manifest": {},
     "device_username": "",
     "device_password": "",
+    "device_http_port": 80,
     "backup": {
         "dir": "./backups",
         "timeout_s": 10,
+        "upload_timeout_s": 30,
         "inter_request_delay_ms": 150,
+        "max_file_bytes": 1048576,
+        "keep_manual": 10,
+        "restore_verify": "size",
+        "include_patterns": ["/config_*.json", "/secret.json", "/macros/*.lua", "/avrisp.json"],
+        "exclude_patterns": ["/_version_fs.json", "/*_cfg.json"],
         "extra_config_files": []
+    },
+    "fs_update": {
+        "keep_snapshots": 5,
+        "reconnect_timeout_s": 300,
+        "status_poll_s": 3,
+        "restart_after_restore": True
     },
     "udp_listener": {
         "is_listening": True,
@@ -105,44 +120,16 @@ DEFAULT_DISPLAY_FORMAT = {
 # ============================================================
 # Бэкап конфигов и скриптов с устройств
 # ============================================================
-BACKUP_SCHEMA_VERSION = 1
+BACKUP_SCHEMA_VERSION = 2
 BACKUP_DEFAULT_DIR = "./backups"
 BACKUP_DEFAULT_TIMEOUT_S = 10
+BACKUP_DEFAULT_UPLOAD_TIMEOUT_S = 30
 BACKUP_DEFAULT_DELAY_MS = 150
-
-# JSON-файлы, которые проверяются всегда (ядро + секреты + метаданные ФС).
-BACKUP_CORE_FILES = [
-    "/config_sys.json",
-    "/config_time.json",
-    "/config_ntp.json",
-    "/config_wifi.json",
-    "/config_wifi0.json",
-    "/config_wifi1.json",
-    "/config_wifi2.json",
-    "/config_wifi3.json",
-    "/config_state.json",
-    "/secret.json",
-    "/_version_fs.json",
-]
-
-# Карта: имя компонента из modules.included (_version_fs.json) -> JSON-файлы.
-BACKUP_MODULE_CONFIGS = {
-    "module_udp": ["/config_udp.json"],
-    "module_ds3231": ["/config_ds3231.json"],
-    "module_otaclient": ["/config_otaclient.json"],
-    "module_macros": ["/config_macros.json", "/macros/resources.json"],
-    "module_rgb": ["/config_rgb.json"],
-    "module_lcd-i2c": ["/config_lcd-i2c.json"],
-    "module_veml7700": ["/config_veml7700.json"],
-    "module_program": ["/config_prog.json"],
-    "module_prog": ["/config_prog.json"],
-    "submodule_isp": ["/avrisp_cfg.json", "/avrisp.json"],
-    "submodule_swd": ["/swd_cfg.json"],
-    "module_template": ["/config_template.json"],
-    "device_clock-mech": ["/config_clock-mech.json"],
-    "device_mech-ring": ["/config_ring-mech.json"],
-    "device_electronica7_rgb": ["/config_e7rgb.json"],
-}
+BACKUP_DEFAULT_MAX_FILE_BYTES = 1024 * 1024
+BACKUP_DEFAULT_KEEP_MANUAL = 10
+BACKUP_DEFAULT_INCLUDE = ["/config_*.json", "/secret.json", "/macros/*.lua", "/avrisp.json"]
+BACKUP_DEFAULT_EXCLUDE = ["/_version_fs.json", "/*_cfg.json"]
+CORE_FS_API_VERSION = 1
 
 _WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -682,7 +669,7 @@ def load_config():
             merged = copy.deepcopy(DEFAULT_CONFIG)
             merged.update(cfg)
             # Убедимся, что вложенные секции есть
-            for section in ['udp_listener', 'traffic_light', 'manifest', 'logging', 'backup']:
+            for section in ['udp_listener', 'traffic_light', 'manifest', 'logging', 'backup', 'fs_update']:
                 if section not in merged or not isinstance(merged[section], dict):
                     merged[section] = copy.deepcopy(DEFAULT_CONFIG[section])
                 else:
@@ -715,7 +702,9 @@ def save_config(cfg):
         "manifest": cfg.get("manifest", DEFAULT_CONFIG["manifest"]),
         "device_username": cfg.get("device_username", DEFAULT_CONFIG["device_username"]),
         "device_password": cfg.get("device_password", DEFAULT_CONFIG["device_password"]),
+        "device_http_port": cfg.get("device_http_port", DEFAULT_CONFIG["device_http_port"]),
         "backup": cfg.get("backup", DEFAULT_CONFIG["backup"]),
+        "fs_update": cfg.get("fs_update", DEFAULT_CONFIG["fs_update"]),
         "udp_listener": cfg.get("udp_listener", DEFAULT_CONFIG["udp_listener"]),
         "traffic_light": cfg.get("traffic_light", DEFAULT_CONFIG["traffic_light"]),
         "logging": cfg.get("logging", DEFAULT_CONFIG["logging"])
@@ -778,26 +767,6 @@ def _int_value(value, default, minimum=0):
     return max(minimum, result)
 
 
-def _backup_settings():
-    """Актуальные настройки бэкапа (с дефолтами)."""
-    cfg = config.get("backup", {}) or {}
-    return {
-        "dir": str(cfg.get("dir") or BACKUP_DEFAULT_DIR),
-        "timeout_s": _int_value(cfg.get("timeout_s"), BACKUP_DEFAULT_TIMEOUT_S, 1),
-        "delay_ms": _int_value(cfg.get("inter_request_delay_ms"), BACKUP_DEFAULT_DELAY_MS, 0),
-        "extra_config_files": cfg.get("extra_config_files") or [],
-    }
-
-
-def _device_auth():
-    """HTTP Basic для устройств (None, если креды не заданы)."""
-    user = str(config.get("device_username") or "").strip()
-    password = str(config.get("device_password") or "")
-    if user and password:
-        return (user, password)
-    return None
-
-
 def _sanitize_name(value, fallback=""):
     """Безопасное имя файла/папки (Unicode сохраняется)."""
     text = str(value or "").strip()
@@ -809,7 +778,6 @@ def _sanitize_name(value, fallback=""):
     if text.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
         text = "_" + text
     return text[:64]
-
 
 def _safe_rel_path(path):
     """Превратить путь внутри ФС устройства в безопасный относительный путь."""
@@ -828,7 +796,6 @@ def _safe_rel_path(path):
         return None
     return os.path.join(*parts)
 
-
 def _unique_rel_path(rel_path, used):
     """Развести совпадающие относительные пути суффиксом _2, _3, ..."""
     key = rel_path.lower()
@@ -843,7 +810,6 @@ def _unique_rel_path(rel_path, used):
     used.add(result.lower())
     return result
 
-
 def _validate_ip(ip):
     """Проверить, что IP — корректный IPv4-адрес."""
     try:
@@ -854,19 +820,6 @@ def _validate_ip(ip):
         return None
     return str(addr)
 
-
-def _device_get(ip, path, cfg, auth):
-    """GET с устройства (последовательно, с закрытием соединения)."""
-    timeout = cfg.get("timeout_s", BACKUP_DEFAULT_TIMEOUT_S)
-    return requests.get(
-        f"http://{ip}{path}",
-        timeout=(min(5, timeout), timeout),
-        auth=auth,
-        headers={"Connection": "close"},
-        allow_redirects=False,
-    )
-
-
 def _parse_cvt(text):
     """Разобрать ответ /system/version формата key|value|div."""
     result = {}
@@ -875,7 +828,6 @@ def _parse_cvt(text):
         if len(parts) >= 2:
             result[parts[0].strip()] = parts[1].strip()
     return result
-
 
 def _looks_like_html(data, headers=None):
     """Отличить HTML-страницу 404 от файла (ESP отдаёт её с кодом 200)."""
@@ -887,7 +839,6 @@ def _looks_like_html(data, headers=None):
     head = (data or b"")[:512].lstrip().lower()
     return head.startswith(b"<!doctype html") or head.startswith(b"<html")
 
-
 def _valid_json_bytes(data):
     """Проверить, что содержимое — валидный JSON."""
     try:
@@ -895,7 +846,6 @@ def _valid_json_bytes(data):
         return True
     except (UnicodeDecodeError, ValueError):
         return False
-
 
 def _fetch_identity(ip, cfg, auth):
     """Вернуть (info, raw_text, error, fatal)."""
@@ -910,137 +860,11 @@ def _fetch_identity(ip, cfg, auth):
         return {}, "", "HTTP 401: check device_username/device_password", True
     return {}, "", f"/system/version: HTTP {resp.status_code}", False
 
-
-def _fetch_version_json(ip, cfg, auth):
-    """Вернуть (content, parsed_json, error, fatal)."""
-    try:
-        resp = _device_get(ip, "/_version_fs.json", cfg, auth)
-    except Exception as e:
-        return None, None, f"/_version_fs.json: {e}", False
-    if resp.status_code == 200:
-        if _looks_like_html(resp.content, resp.headers):
-            return None, None, "/_version_fs.json: HTML page (ignored)", False
-        if not _valid_json_bytes(resp.content):
-            return None, None, "/_version_fs.json: invalid JSON (ignored)", False
-        try:
-            return resp.content, resp.json(), None, False
-        except ValueError:
-            return None, None, "/_version_fs.json: invalid JSON (ignored)", False
-    if resp.status_code == 404:
-        return None, None, None, False
-    if resp.status_code == 401:
-        return None, None, "/_version_fs.json: HTTP 401 (auth)", True
-    return None, None, f"/_version_fs.json: HTTP {resp.status_code}", False
-
-
-def _module_config_paths(version_json):
-    """JSON-пути модулей по modules.included (или все известные)."""
-    included = []
-    if isinstance(version_json, dict):
-        modules = version_json.get("modules")
-        if isinstance(modules, dict) and isinstance(modules.get("included"), list):
-            included = [str(item) for item in modules["included"] if isinstance(item, str)]
-
-    paths = []
-    if included:
-        for name in included:
-            paths.extend(BACKUP_MODULE_CONFIGS.get(name, []))
-    else:
-        for values in BACKUP_MODULE_CONFIGS.values():
-            paths.extend(values)
-    return paths
-
-
-def _candidate_specs(version_json, extra_files):
-    """Список (request_path, relative_file_path) для JSON-конфигов."""
-    raw_paths = list(BACKUP_CORE_FILES) + _module_config_paths(version_json) + list(extra_files or [])
-    specs = []
-    seen = set()
-    for raw in raw_paths:
-        if not isinstance(raw, str):
-            continue
-        path = "/" + raw.strip().lstrip("/")
-        parts = [part for part in path.split("/") if part]
-        if not parts or any(part == ".." for part in parts):
-            continue
-        if path in seen:
-            continue
-        rel_path = _safe_rel_path("/".join(parts))
-        if not rel_path:
-            continue
-        seen.add(path)
-        specs.append((path, rel_path))
-    return specs
-
-
-def _fetch_macro_names(ip, cfg, auth, result):
-    """Имена Lua-файлов из /macros/list (пусто, если модуля нет)."""
-    try:
-        resp = _device_get(ip, "/macros/list", cfg, auth)
-    except Exception as e:
-        result["errors"].append(f"/macros/list: {e}")
-        return []
-    if resp.status_code == 200:
-        if _looks_like_html(resp.content, resp.headers):
-            result["warnings"].append("/macros/list: HTML page (module_macros not built)")
-            return []
-        try:
-            data = resp.json()
-        except ValueError:
-            result["errors"].append("/macros/list: invalid JSON")
-            return []
-        files = data.get("files") if isinstance(data, dict) else None
-        if not isinstance(files, list):
-            return []
-        names = []
-        for item in files:
-            if isinstance(item, dict) and isinstance(item.get("name"), str):
-                name = item["name"].strip()
-                if name:
-                    names.append(name)
-        return names
-    if resp.status_code == 404:
-        return []
-    if resp.status_code == 401:
-        result["errors"].append("/macros/list: HTTP 401 (auth)")
-        return []
-    result["errors"].append(f"/macros/list: HTTP {resp.status_code}")
-    return []
-
-
-def _macro_specs(names, warnings):
-    """Список (request_path, relative_file_path) для Lua-скриптов."""
-    specs = []
-    used = set()
-    seen = set()
-    for name in names:
-        base = str(name or "").replace("\\", "/").strip().lstrip("/")
-        if base.startswith("macros/"):
-            base = base[len("macros/"):]
-        if not base or "/" in base or base in (".", ".."):
-            warnings.append(f"macro skipped (bad name): {name}")
-            continue
-        if not base.lower().endswith(".lua"):
-            warnings.append(f"macro skipped (not .lua): {name}")
-            continue
-        if base.lower() in seen:
-            continue
-        seen.add(base.lower())
-        rel_path = _safe_rel_path(os.path.join("macros", base))
-        if not rel_path:
-            warnings.append(f"macro skipped (bad path): {name}")
-            continue
-        rel_path = _unique_rel_path(rel_path, used)
-        specs.append(("/macros/" + quote(base, safe=""), rel_path))
-    return specs
-
-
 def _backup_delay(cfg):
     """Пауза между запросами к устройству."""
     delay_ms = cfg.get("delay_ms", 0)
     if delay_ms > 0:
         time.sleep(delay_ms / 1000.0)
-
 
 def _write_file(root, rel_path, data):
     """Записать файл, не выходя за пределы корневой папки."""
@@ -1054,11 +878,9 @@ def _write_file(root, rel_path, data):
     with open(dest, "wb") as f:
         f.write(data)
 
-
 def _write_json_file(root, rel_path, data):
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
     _write_file(root, rel_path, payload)
-
 
 def _folder_owner_mac(folder_path):
     """MAC владельца существующей папки бэкапа (пусто, если meta нет)."""
@@ -1073,198 +895,418 @@ def _folder_owner_mac(folder_path):
     except Exception:
         return ""
 
+# ============================================================
+# Версионные снимки (schema 2) и /fs API ядра
+# ============================================================
 
-def _pick_device_folder(live, dev, backup_root, reserved):
-    """Имя папки: devicename_serial с защитой от коллизий."""
-    name = _sanitize_name((live or {}).get("devicename") or dev.get("deviceName", ""))
-    serial = _sanitize_name((live or {}).get("deviceserial") or dev.get("deviceSerial", ""))
-    mac = str(dev.get("mac") or "")
-    mac6 = re.sub(r"[^0-9A-Za-z]", "", mac)[-6:].upper() or "unknown"
-
-    if name and serial:
-        base = f"{name}_{serial}"
-    elif name:
-        base = name
-    elif serial:
-        base = serial
-    else:
-        base = f"device_{mac6}"
-    base = base[:120].strip(" ._") or f"device_{mac6}"
-
-    candidates = [base, f"{base}__{mac6}"]
-    candidates += [f"{base}__{mac6}_{index}" for index in range(2, 100)]
-    for candidate in candidates:
-        if candidate.lower() in reserved:
-            continue
-        owner = _folder_owner_mac(os.path.join(backup_root, candidate))
-        if owner and owner != mac.lower():
-            continue
-        reserved.add(candidate.lower())
-        return candidate
-
-    fallback = f"{base}__{mac6}_{int(time.time())}"
-    reserved.add(fallback.lower())
-    return fallback
+def _device_auth():
+    user = config.get("device_username") or ""
+    password = config.get("device_password") or ""
+    return (user, password) if user else None
 
 
 def _cleanup_backup_staging(backup_root):
-    """Удалить незавершённые staging-папки при старте."""
+    if not os.path.isdir(backup_root):
+        return
+    for name in os.listdir(backup_root):
+        if not (name.startswith(".incoming-") or name.startswith(".old-")):
+            continue
+        path = os.path.join(backup_root, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _backup_settings():
+    """Актуальные настройки бэкапов."""
+    cfg = config.get("backup", {}) or {}
+    base_dir = os.path.abspath(str(cfg.get("dir") or BACKUP_DEFAULT_DIR))
+    return {
+        "dir": base_dir,
+        "timeout_s": _int_value(cfg.get("timeout_s"), BACKUP_DEFAULT_TIMEOUT_S, 1),
+        "upload_timeout_s": _int_value(cfg.get("upload_timeout_s"),
+                                        BACKUP_DEFAULT_UPLOAD_TIMEOUT_S, 1),
+        "delay_ms": _int_value(cfg.get("inter_request_delay_ms"), BACKUP_DEFAULT_DELAY_MS, 0),
+        "max_file_bytes": _int_value(cfg.get("max_file_bytes"),
+                                     BACKUP_DEFAULT_MAX_FILE_BYTES, 1),
+        "keep_manual": _int_value(cfg.get("keep_manual"), BACKUP_DEFAULT_KEEP_MANUAL, 0),
+        "restore_verify": str(cfg.get("restore_verify") or "size").lower(),
+        "include_patterns": [str(x) for x in (cfg.get("include_patterns")
+                                               or BACKUP_DEFAULT_INCLUDE)],
+        "exclude_patterns": [str(x) for x in (cfg.get("exclude_patterns")
+                                               or BACKUP_DEFAULT_EXCLUDE)],
+        "extra_config_files": cfg.get("extra_config_files") or [],
+        "port": _int_value(config.get("device_http_port"), 80, 1),
+    }
+
+
+def _device_url(ip, path, cfg=None):
+    port = _int_value((cfg or {}).get("port"), 80, 1)
+    host = f"{ip}:{port}" if port != 80 else str(ip)
+    if not str(path).startswith("/"):
+        path = "/" + str(path)
+    return f"http://{host}{path}"
+
+
+def _device_get(ip, path, cfg, auth):
+    timeout = cfg.get("timeout_s", BACKUP_DEFAULT_TIMEOUT_S)
+    return requests.get(
+        _device_url(ip, path, cfg),
+        timeout=(min(5, timeout), timeout),
+        auth=auth,
+        headers={"Connection": "close"},
+        allow_redirects=False,
+    )
+
+
+def _device_post(ip, path, cfg, auth, data=None, content_type=None, upload=False):
+    timeout = cfg.get("upload_timeout_s" if upload else "timeout_s",
+                      BACKUP_DEFAULT_UPLOAD_TIMEOUT_S if upload else BACKUP_DEFAULT_TIMEOUT_S)
+    headers = {"Connection": "close"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return requests.post(
+        _device_url(ip, path, cfg),
+        data=data,
+        timeout=(min(5, timeout), timeout),
+        auth=auth,
+        headers=headers,
+        allow_redirects=False,
+    )
+
+
+def _fetch_fs_info(ip, cfg, auth):
+    """(info, error, fatal) для /fs/info."""
     try:
-        os.makedirs(backup_root, exist_ok=True)
-        for entry in os.listdir(backup_root):
-            if entry.startswith(".incoming-") or entry.startswith(".old-"):
-                shutil.rmtree(os.path.join(backup_root, entry), ignore_errors=True)
+        resp = _device_get(ip, "/fs/info", cfg, auth)
     except Exception as e:
-        print(f"Backup staging cleanup error: {e}")
-
-
-def _publish_backup(staging, target):
-    """Заменить папку устройства подготовленной staging-папкой."""
-    old = None
-    if os.path.isdir(target):
-        old = target + ".old-" + str(os.getpid()) + "-" + str(int(time.time() * 1000))
-        os.replace(target, old)
+        return None, f"/fs/info: {e}", True
+    if resp.status_code == 401:
+        return None, "/fs/info: HTTP 401 (auth)", True
+    if resp.status_code != 200:
+        return None, f"/fs/info: HTTP {resp.status_code}", True
+    if _looks_like_html(resp.content, resp.headers):
+        return None, "/fs/info: HTML (core_fs not available)", True
     try:
-        os.replace(staging, target)
-    except Exception:
-        if old and not os.path.isdir(target):
-            os.replace(old, target)
-            old = None
-        raise
-    finally:
-        if old:
-            shutil.rmtree(old, ignore_errors=True)
+        info = resp.json()
+    except ValueError:
+        return None, "/fs/info: invalid JSON", True
+    if not isinstance(info, dict) or info.get("api") != CORE_FS_API_VERSION:
+        return None, "/fs/info: unsupported api", True
+    return info, None, False
 
 
-def _download_specs(specs, ip, cfg, auth, staging, result, prefetched, used_rel):
-    """Скачать список файлов в staging. Вернуть (stored_files, fatal)."""
-    stored_files = []
-    for request_path, rel_path in specs:
-        made_request = False
-        resp_headers = None
-        if request_path == "/_version_fs.json" and request_path in prefetched:
-            status = 200
-            data = prefetched[request_path]
-        else:
-            try:
-                resp = _device_get(ip, request_path, cfg, auth)
-                status = resp.status_code
-                data = resp.content if status == 200 else b""
-                resp_headers = resp.headers
-                made_request = True
-            except Exception as e:
-                result["errors"].append(f"{request_path}: {e}")
-                _backup_delay(cfg)
+def _fetch_fs_list(ip, cfg, auth):
+    """(entries, info, error, fatal) для /fs/list."""
+    try:
+        resp = _device_get(ip, "/fs/list", cfg, auth)
+    except Exception as e:
+        return None, None, f"/fs/list: {e}", True
+    if resp.status_code == 401:
+        return None, None, "/fs/list: HTTP 401 (auth)", True
+    if resp.status_code != 200:
+        return None, None, f"/fs/list: HTTP {resp.status_code}", True
+    if _looks_like_html(resp.content, resp.headers):
+        return None, None, "/fs/list: HTML (core_fs not available)", True
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, None, "/fs/list: invalid JSON", True
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        return None, None, "/fs/list: bad schema", True
+    if data.get("count") != len(data.get("entries")):
+        return None, None, "/fs/list: count mismatch", True
+    if data.get("truncated"):
+        return None, None, "/fs/list: truncated", True
+    return data.get("entries"), data, None, False
+
+
+def _select_snapshot_files(entries, cfg):
+    include = cfg.get("include_patterns") or BACKUP_DEFAULT_INCLUDE
+    exclude = cfg.get("exclude_patterns") or BACKUP_DEFAULT_EXCLUDE
+    extra = set()
+    for raw in cfg.get("extra_config_files") or []:
+        if isinstance(raw, str) and raw.strip():
+            path = "/" + raw.strip().lstrip("/")
+            if path != "/_version_fs.json":
+                extra.add(path)
+
+    selected = []
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("type") != "file":
+            continue
+        path = str(entry.get("path") or "")
+        if not path.startswith("/") or ".." in path.split("/"):
+            continue
+        low = path.lower()
+        if path not in extra:
+            if not any(fnmatch.fnmatchcase(low, str(p).lower()) for p in include):
                 continue
+            if any(fnmatch.fnmatchcase(low, str(p).lower()) for p in exclude):
+                continue
+        selected.append(entry)
+    selected.sort(key=lambda e: str(e.get("path") or ""))
+    return selected
 
-        if status == 200:
-            is_html = _looks_like_html(data, resp_headers)
-            is_bad_json = request_path.lower().endswith(".json") and not _valid_json_bytes(data)
-            if is_html or is_bad_json:
-                result["missing"].append(request_path)
-                reason = "HTML page instead of file" if is_html else "invalid JSON"
-                result["warnings"].append(f"{request_path}: {reason} (ignored)")
-            else:
-                stored_rel = _unique_rel_path(rel_path, used_rel)
-                _write_file(staging, stored_rel, data)
-                stored_files.append({
-                    "path": request_path,
-                    "file": stored_rel.replace(os.sep, "/"),
-                    "size": len(data),
-                    "sha256": hashlib.sha256(data).hexdigest(),
+
+def _device_key(live, dev):
+    name = _sanitize_name((live or {}).get("devicename") or dev.get("deviceName") or "")
+    serial = _sanitize_name((live or {}).get("deviceserial") or dev.get("deviceSerial") or "")
+    mac = str(dev.get("mac") or "")
+    mac6 = re.sub(r"[^0-9A-Za-z]", "", mac)[-6:].upper() or "unknown"
+    base = f"{name}_{serial}" if name and serial else (name or serial or f"device_{mac6}")
+    base = base[:100].strip(" ._") or f"device_{mac6}"
+    return f"{base}__{mac6}"
+
+
+def _snapshot_target(backup_root, device_key, kind):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = os.path.join(backup_root, device_key, f"{stamp}_{kind}")
+    target = base
+    index = 2
+    while os.path.exists(target):
+        target = f"{base}_{index}"
+        index += 1
+    return target
+
+
+def _snapshot_id(backup_root, target):
+    return os.path.relpath(target, backup_root).replace(os.sep, "/")
+
+
+def _snapshot_paths_from_entries(entries):
+    return [str(e.get("path")) for e in entries if e.get("type") == "file"]
+
+
+def _snapshot_meta(backup_root, snapshot_id):
+    """(path, meta) снимка; ValueError при неверном id."""
+    parts = [p for p in str(snapshot_id or "").replace("\\", "/").split("/") if p]
+    if len(parts) != 2 or any(p in (".", "..") for p in parts):
+        raise ValueError("bad snapshot id")
+    path = os.path.abspath(os.path.join(backup_root, parts[0], parts[1]))
+    root = os.path.abspath(backup_root)
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("snapshot escapes root")
+    meta_path = os.path.join(path, "meta.json")
+    if not os.path.isfile(meta_path):
+        raise ValueError("snapshot not found")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if not isinstance(meta, dict) or meta.get("schema") != BACKUP_SCHEMA_VERSION:
+        raise ValueError("unsupported snapshot schema")
+    return path, meta
+
+
+def _list_snapshots(backup_root):
+    result = []
+    if not os.path.isdir(backup_root):
+        return result
+    for device_key in sorted(os.listdir(backup_root)):
+        if device_key.startswith("."):
+            continue
+        device_dir = os.path.join(backup_root, device_key)
+        if not os.path.isdir(device_dir):
+            continue
+        for snap in sorted(os.listdir(device_dir)):
+            if snap.startswith("."):
+                continue
+            snap_dir = os.path.join(device_dir, snap)
+            if not os.path.isdir(snap_dir):
+                continue
+            meta_path = os.path.join(snap_dir, "meta.json")
+            item = {
+                "id": f"{device_key}/{snap}",
+                "deviceKey": device_key,
+                "snapshot": snap,
+                "kind": "unknown",
+                "createdAt": "",
+                "device": {},
+                "fsVersion": "",
+                "fwVersion": "",
+                "files": 0,
+                "bytes": 0,
+                "warnings": 0,
+                "errors": 0,
+                "broken": False,
+            }
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if not isinstance(meta, dict):
+                    raise ValueError("meta is not object")
+                device = meta.get("device") or {}
+                item.update({
+                    "kind": meta.get("kind") or "unknown",
+                    "createdAt": meta.get("createdAt") or "",
+                    "device": device,
+                    "fsVersion": str(device.get("versionfs") or ""),
+                    "fwVersion": str(device.get("versionapp") or ""),
+                    "files": len(meta.get("files") or []),
+                    "bytes": sum(int(x.get("size") or 0) for x in (meta.get("files") or [])
+                                 if isinstance(x, dict)),
+                    "warnings": len(meta.get("warnings") or []),
+                    "errors": len(meta.get("errors") or []),
                 })
-                result["files"] += 1
-                result["bytes"] += len(data)
-        elif status == 404:
-            result["missing"].append(request_path)
-        elif status == 403:
-            result["warnings"].append(f"{request_path}: HTTP 403 (hidden)")
-        elif status == 401:
-            result["errors"].append(f"{request_path}: HTTP 401 (auth)")
-            return stored_files, True
-        else:
-            result["errors"].append(f"{request_path}: HTTP {status}")
-
-        if made_request:
-            _backup_delay(cfg)
-
-    return stored_files, False
+            except Exception as e:
+                item["broken"] = True
+                item["createdAt"] = datetime.fromtimestamp(
+                    os.path.getmtime(snap_dir), timezone.utc).isoformat()
+                item["device"] = {"error": str(e)}
+            result.append(item)
+    result.sort(key=lambda x: x.get("createdAt") or "", reverse=True)
+    return result
 
 
-def _backup_one_device(dev, cfg, auth, backup_root, reserved):
-    """Выгрузить конфиги и скрипты одного устройства."""
+def _prune_snapshots(backup_root, device_key, kind, keep):
+    if keep <= 0:
+        return
+    device_dir = os.path.join(backup_root, device_key)
+    if not os.path.isdir(device_dir):
+        return
+    snaps = []
+    for name in os.listdir(device_dir):
+        path = os.path.join(device_dir, name)
+        if name.startswith(".") or not os.path.isdir(path):
+            continue
+        meta_path = os.path.join(path, "meta.json")
+        created = ""
+        snap_kind = ""
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            created = str(meta.get("createdAt") or "")
+            snap_kind = str(meta.get("kind") or "")
+        except Exception:
+            continue
+        if snap_kind != kind:
+            continue
+        snaps.append((created, path))
+    snaps.sort(reverse=True)
+    for _, path in snaps[keep:]:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _backup_one_device(dev, cfg, auth, backup_root, reserved=None,
+                       kind="manual", preloaded=None):
+    """Создать versioned-снимок одного устройства."""
     mac = str(dev.get("mac") or "")
     result = {
         "mac": mac,
         "deviceName": str(dev.get("deviceName") or ""),
         "deviceSerial": str(dev.get("deviceSerial") or ""),
         "ip": str(dev.get("ip") or ""),
+        "deviceKey": "",
+        "snapshot": "",
+        "id": "",
         "folder": "",
+        "kind": kind,
         "ok": False,
         "files": 0,
         "bytes": 0,
+        "requests": 0,
         "missing": [],
         "warnings": [],
         "errors": [],
     }
-
     ip = _validate_ip(dev.get("ip"))
     if not ip:
         result["errors"].append("Invalid or empty IP")
         return result
     result["ip"] = ip
 
-    live, raw_version, identity_error, identity_fatal = _fetch_identity(ip, cfg, auth)
-    if identity_error:
-        if identity_fatal:
+    raw_version = ""
+    if preloaded:
+        live = preloaded.get("live") or {}
+        info = preloaded.get("info")
+        entries = preloaded.get("entries")
+        raw_version = preloaded.get("raw_version") or ""
+    else:
+        live, raw_version, identity_error, identity_fatal = _fetch_identity(ip, cfg, auth)
+        result["requests"] += 1
+        if identity_error and identity_fatal:
             result["errors"].append(identity_error)
             return result
-        result["warnings"].append(identity_error)
-
-    version_content, version_json, version_error, version_fatal = _fetch_version_json(ip, cfg, auth)
-    if version_error:
-        if version_fatal:
-            result["errors"].append(version_error)
+        info, error, fatal = _fetch_fs_info(ip, cfg, auth)
+        result["requests"] += 1
+        if error:
+            result["errors"].append(error)
             return result
-        result["warnings"].append(version_error)
+        entries, _, error, fatal = _fetch_fs_list(ip, cfg, auth)
+        result["requests"] += 1
+        if error:
+            result["errors"].append(error)
+            return result
 
-    folder = _pick_device_folder(live, dev, backup_root, reserved)
-    result["folder"] = folder
+    device_key = _device_key(live, dev)
+    result["deviceKey"] = device_key
     result["deviceName"] = str(live.get("devicename") or dev.get("deviceName") or "")
     result["deviceSerial"] = str(live.get("deviceserial") or dev.get("deviceSerial") or "")
 
-    config_specs = _candidate_specs(version_json, cfg.get("extra_config_files"))
+    selected = _select_snapshot_files(entries, cfg)
+    if not selected:
+        result["errors"].append("No user files selected")
+        return result
 
-    staging = os.path.join(
-        backup_root,
-        f".incoming-{folder}-{os.getpid()}-{int(time.time() * 1000)}",
-    )
+    staging = os.path.join(backup_root,
+                           f".incoming-{device_key}-{os.getpid()}-{int(time.time() * 1000)}")
     os.makedirs(staging, exist_ok=False)
-
+    stored = []
     used_rel = set()
-    prefetched = {}
-    if version_content is not None:
-        prefetched["/_version_fs.json"] = version_content
 
     try:
-        # Сначала конфиги: /macros/list — самый тяжёлый эндпоинт и может уронить heap.
-        stored_files, fatal = _download_specs(
-            config_specs, ip, cfg, auth, staging, result, prefetched, used_rel
-        )
+        for entry in selected:
+            path = str(entry.get("path") or "")
+            size = int(entry.get("size") or 0)
+            if size > cfg.get("max_file_bytes", BACKUP_DEFAULT_MAX_FILE_BYTES):
+                result["errors"].append(f"{path}: too large ({size} bytes)")
+                continue
+            req_path = "/fs/download?path=" + quote(path, safe="")
+            try:
+                resp = _device_get(ip, req_path, cfg, auth)
+                result["requests"] += 1
+            except Exception as e:
+                result["errors"].append(f"{path}: {e}")
+                _backup_delay(cfg)
+                continue
+            if resp.status_code == 404:
+                result["missing"].append(path)
+                _backup_delay(cfg)
+                continue
+            if resp.status_code == 401:
+                result["errors"].append(f"{path}: HTTP 401 (auth)")
+                shutil.rmtree(staging, ignore_errors=True)
+                return result
+            if resp.status_code != 200:
+                result["errors"].append(f"{path}: HTTP {resp.status_code}")
+                _backup_delay(cfg)
+                continue
+            data = resp.content or b""
+            rel = _safe_rel_path(path)
+            if not rel:
+                result["warnings"].append(f"{path}: skipped (bad path)")
+                continue
+            rel = _unique_rel_path(rel, used_rel)
+            _write_file(staging, rel, data)
+            stored.append({
+                "path": path,
+                "devicePath": path,
+                "file": rel.replace(os.sep, "/"),
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            })
+            result["files"] += 1
+            result["bytes"] += len(data)
+            _backup_delay(cfg)
 
-        # Скрипты — только после конфигов и только если нет фатальной ошибки auth.
-        if not fatal:
-            macro_names = _fetch_macro_names(ip, cfg, auth, result)
-            macro_specs = _macro_specs(macro_names, result["warnings"])
-            stored_scripts, _ = _download_specs(
-                macro_specs, ip, cfg, auth, staging, result, prefetched, used_rel
-            )
-            stored_files.extend(stored_scripts)
+        if result["files"] == 0:
+            result["errors"].append("No files downloaded")
+            shutil.rmtree(staging, ignore_errors=True)
+            return result
 
         meta = {
             "schema": BACKUP_SCHEMA_VERSION,
+            "kind": kind,
             "createdAt": datetime.now(timezone.utc).isoformat(),
-            "folder": folder,
+            "deviceKey": device_key,
             "device": {
                 "mac": mac,
                 "name": result["deviceName"],
@@ -1279,30 +1321,30 @@ def _backup_one_device(dev, cfg, auth, backup_root, reserved):
                 "gitcommit": str(live.get("gitcommit") or ""),
             },
             "systemVersionRaw": raw_version,
-            "containsSecrets": True,
-            "files": stored_files,
+            "fsApi": CORE_FS_API_VERSION,
+            "fsInfo": info,
+            "fsList": {"count": len(entries), "truncated": False, "entries": entries},
+            "files": stored,
             "missing": result["missing"],
             "warnings": result["warnings"],
             "errors": result["errors"],
+            "stats": {
+                "requests": result["requests"],
+                "bytesRead": result["bytes"],
+                "bytesWritten": 0,
+                "durationMs": 0,
+            },
         }
         _write_json_file(staging, "meta.json", meta)
-
-        if result["files"] == 0:
-            result["errors"].append("No files downloaded")
-            shutil.rmtree(staging, ignore_errors=True)
-            return result
-
-        target = os.path.join(backup_root, folder)
-        if result["errors"]:
-            result["ok"] = False
-            if os.path.isdir(target):
-                shutil.rmtree(staging, ignore_errors=True)
-                result["warnings"].append("Existing backup kept (new backup incomplete)")
-                return result
-        else:
-            result["ok"] = True
-
-        _publish_backup(staging, target)
+        target = _snapshot_target(backup_root, device_key, kind)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.replace(staging, target)
+        result["snapshot"] = target
+        result["id"] = _snapshot_id(backup_root, target)
+        result["folder"] = device_key
+        result["ok"] = len(result["errors"]) == 0
+        _prune_snapshots(backup_root, device_key, kind,
+                         cfg.get("keep_manual" if kind == "manual" else "keep_snapshots", 0))
     except Exception as e:
         result["errors"].append(str(e))
         shutil.rmtree(staging, ignore_errors=True)
@@ -1314,29 +1356,11 @@ def _backup_state_snapshot():
         return copy.deepcopy(_BACKUP_STATE)
 
 
-def _broadcast_backup_event(event_type, message, **extra):
-    """Записать событие в лог и разослать подписчикам SSE."""
-    event = {
-        "type": event_type,
-        "message": message,
-        "device_mac": extra.get("device_mac", ""),
-        "device_name": extra.get("device_name", ""),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    for key in ("folder", "ok", "files", "bytes", "error"):
-        if key in extra:
-            event[key] = extra[key]
-    event_log.add(event)
-    sse_manager.broadcast(event)
-
-
 def _backup_worker(devices, cfg, auth):
-    """Фоновый последовательный обход устройств."""
     total = len(devices)
-    backup_root = os.path.abspath(cfg["dir"])
+    backup_root = cfg["dir"]
     reserved = set()
     fatal_error = None
-
     try:
         _broadcast_backup_event("backup_started", f"Backup started: {total} device(s)")
         for index, dev in enumerate(devices, 1):
@@ -1344,54 +1368,28 @@ def _backup_worker(devices, cfg, auth):
             display_name = str(dev.get("deviceName") or mac)
             with _BACKUP_LOCK:
                 _BACKUP_STATE["current"] = display_name
-
             try:
                 result = _backup_one_device(dev, cfg, auth, backup_root, reserved)
             except Exception as e:
-                result = {
-                    "mac": mac,
-                    "deviceName": display_name,
-                    "deviceSerial": str(dev.get("deviceSerial") or ""),
-                    "ip": str(dev.get("ip") or ""),
-                    "folder": "",
-                    "ok": False,
-                    "files": 0,
-                    "bytes": 0,
-                    "missing": [],
-                    "warnings": [],
-                    "errors": [str(e)],
-                }
-
+                result = {"mac": mac, "deviceName": display_name, "ok": False,
+                          "files": 0, "bytes": 0, "errors": [str(e)]}
             with _BACKUP_LOCK:
                 _BACKUP_STATE["done"] = index
                 _BACKUP_STATE["results"].append(copy.deepcopy(result))
-
-            device_name = result.get("deviceName") or display_name
-            folder = result.get("folder") or ""
             errors = "; ".join(result.get("errors") or [])
             if result.get("ok"):
-                message = (
-                    f"[{index}/{total}] {device_name}: "
-                    f"{result.get('files', 0)} file(s), {result.get('bytes', 0)} bytes"
-                    + (f" -> {folder}" if folder else "")
-                )
+                message = f"[{index}/{total}] {display_name}: {result.get('files', 0)} file(s), {result.get('bytes', 0)} bytes -> {result.get('id', '')}"
             else:
-                message = f"[{index}/{total}] {device_name}: error ({errors or 'unknown error'})"
-
+                message = f"[{index}/{total}] {display_name}: error ({errors or 'unknown error'})"
             _broadcast_backup_event(
-                "backup_device_done",
-                message,
-                device_mac=mac,
-                device_name=device_name,
-                folder=folder,
-                ok=bool(result.get("ok")),
-                files=result.get("files", 0),
-                bytes=result.get("bytes", 0),
+                "backup_device_done", message,
+                device_mac=mac, device_name=display_name,
+                folder=result.get("id", ""), ok=bool(result.get("ok")),
+                files=result.get("files", 0), bytes=result.get("bytes", 0),
                 error=errors,
             )
     except Exception as e:
         fatal_error = str(e)
-        print(f"Backup worker error: {e}")
     finally:
         with _BACKUP_LOCK:
             _BACKUP_STATE["running"] = False
@@ -1399,20 +1397,13 @@ def _backup_worker(devices, cfg, auth):
             _BACKUP_STATE["finishedAt"] = datetime.now(timezone.utc).isoformat()
             _BACKUP_STATE["error"] = fatal_error
             snapshot = copy.deepcopy(_BACKUP_STATE)
-
         ok_count = sum(1 for item in snapshot.get("results", []) if item.get("ok"))
         message = f"Backup finished: {ok_count}/{snapshot.get('total', total)} device(s) ok"
-        if fatal_error:
-            message += f" (error: {fatal_error})"
-        _broadcast_backup_event(
-            "backup_finished",
-            message,
-            ok=not fatal_error and ok_count == snapshot.get("total", total),
-        )
+        _broadcast_backup_event("backup_finished", message,
+                                ok=not fatal_error and ok_count == snapshot.get("total", total))
 
 
 def _start_backup(macs):
-    """Запустить фоновое задание. Вернуть (count, error)."""
     unique = []
     seen = set()
     for mac in macs:
@@ -1423,10 +1414,8 @@ def _start_backup(macs):
             continue
         seen.add(value)
         unique.append(value)
-
     if not unique:
         return None, "No MACs provided"
-
     devices = []
     unknown = []
     for mac in unique:
@@ -1435,34 +1424,398 @@ def _start_backup(macs):
             unknown.append(mac)
         else:
             devices.append(device.to_dict())
-
     if unknown:
         return None, "Unknown device(s): " + ", ".join(unknown)
-
     with _BACKUP_LOCK:
         if _BACKUP_STATE["running"]:
             return None, "Backup already running"
         _BACKUP_STATE.update({
-            "running": True,
-            "startedAt": datetime.now(timezone.utc).isoformat(),
-            "finishedAt": None,
-            "total": len(devices),
-            "done": 0,
-            "current": "",
-            "results": [],
-            "error": None,
+            "running": True, "startedAt": datetime.now(timezone.utc).isoformat(),
+            "finishedAt": None, "total": len(devices), "done": 0, "current": "",
+            "results": [], "error": None,
         })
-
     cfg = _backup_settings()
     auth = _device_auth()
-    thread = threading.Thread(
-        target=_backup_worker,
-        args=(devices, cfg, auth),
-        daemon=True,
-        name="device-backup",
-    )
-    thread.start()
+    threading.Thread(target=_backup_worker, args=(devices, cfg, auth),
+                     daemon=True, name="device-backup").start()
     return len(devices), None
+
+
+# ============================================================
+# Restore и FS-update
+# ============================================================
+
+def _broadcast_backup_event(event_type, message, **kwargs):
+    payload = {
+        "type": event_type,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    payload.update(kwargs)
+    try:
+        sse_manager.broadcast(payload)
+    except Exception:
+        pass
+    try:
+        event_log.add(payload)
+    except Exception:
+        pass
+
+
+_RESTORE_LOCK = threading.Lock()
+_RESTORE_STATE = {"running": False, "startedAt": None, "finishedAt": None,
+                  "current": "", "results": [], "error": None}
+_FS_UPDATE_LOCK = threading.Lock()
+_FS_UPDATE_STATE = {"running": False, "startedAt": None, "finishedAt": None,
+                    "current": "", "results": [], "error": None}
+
+
+def _restore_paths(meta):
+    files = [f for f in (meta.get("files") or []) if isinstance(f, dict)]
+    return sorted(files, key=lambda f: str(f.get("devicePath") or f.get("path") or ""))
+
+
+def _restore_snapshot(dev, snapshot_dir, meta, cfg, auth):
+    mac = str(dev.get("mac") or "")
+    ip = _validate_ip(dev.get("ip"))
+    result = {"mac": mac, "id": os.path.basename(os.path.dirname(snapshot_dir)) + "/" + os.path.basename(snapshot_dir),
+              "ok": False, "files": 0, "bytes": 0, "requests": 0,
+              "restored": [], "errors": [], "warnings": []}
+    if not ip:
+        result["errors"].append("Invalid or empty IP")
+        return result
+    snap_mac = str((meta.get("device") or {}).get("mac") or "").lower()
+    if snap_mac and snap_mac != mac.lower():
+        result["errors"].append("Snapshot belongs to another device")
+        return result
+
+    info, error, _ = _fetch_fs_info(ip, cfg, auth)
+    result["requests"] += 1
+    if error:
+        result["errors"].append(error)
+        return result
+
+    files = _restore_paths(meta)
+    restore = [f for f in files if not any(fnmatch.fnmatchcase(
+        str(f.get("devicePath") or f.get("path") or "").lower(), str(p).lower())
+        for p in (cfg.get("exclude_patterns") or []))]
+    restore.sort(key=lambda f: 1 if str(f.get("devicePath") or f.get("path") or "").lower() == "/secret.json" else 0)
+
+    needed = sum(int(f.get("size") or 0) for f in restore)
+    if int(info.get("free") or 0) > 0 and needed > int(info.get("free") or 0):
+        result["errors"].append("Not enough free space")
+        return result
+
+    for item in restore:
+        device_path = str(item.get("devicePath") or item.get("path") or "")
+        local_file = str(item.get("file") or "")
+        target = os.path.abspath(os.path.join(snapshot_dir, local_file))
+        if os.path.commonpath([os.path.abspath(snapshot_dir), target]) != os.path.abspath(snapshot_dir):
+            result["errors"].append(f"{device_path}: bad local path")
+            continue
+        if not os.path.isfile(target):
+            result["errors"].append(f"{device_path}: missing local file")
+            continue
+        with open(target, "rb") as f:
+            data = f.read()
+        try:
+            resp = _device_post(ip, "/fs/upload?path=" + quote(device_path, safe=""),
+                                cfg, auth, data=data,
+                                content_type="application/octet-stream", upload=True)
+            result["requests"] += 1
+        except Exception as e:
+            result["warnings"].append(f"{device_path}: {e}")
+            continue
+        if resp.status_code == 401:
+            result["warnings"].append(f"{device_path}: HTTP 401 after restore")
+        elif resp.status_code != 200:
+            result["errors"].append(f"{device_path}: HTTP {resp.status_code}")
+        else:
+            result["files"] += 1
+            result["bytes"] += len(data)
+            result["restored"].append(device_path)
+        _backup_delay(cfg)
+
+    # Проверка размеров одним /fs/list (без пофайлового re-download).
+    entries, _, error, _ = _fetch_fs_list(ip, cfg, auth)
+    result["requests"] += 1
+    if error:
+        result["warnings"].append(f"verify: {error}")
+    elif cfg.get("restore_verify") == "hash":
+        by_path = {str(e.get("path")): e for e in entries if isinstance(e, dict)}
+        for item in restore:
+            device_path = str(item.get("devicePath") or item.get("path") or "")
+            local_file = str(item.get("file") or "")
+            target = os.path.join(snapshot_dir, local_file)
+            if device_path not in by_path or not os.path.isfile(target):
+                continue
+            try:
+                resp = _device_get(ip, "/fs/download?path=" + quote(device_path, safe=""),
+                                   cfg, auth)
+                result["requests"] += 1
+                if resp.status_code == 200:
+                    with open(target, "rb") as f:
+                        expected = hashlib.sha256(f.read()).hexdigest()
+                    if hashlib.sha256(resp.content).hexdigest() != expected:
+                        result["errors"].append(f"{device_path}: hash mismatch")
+            except Exception as e:
+                result["warnings"].append(f"verify {device_path}: {e}")
+    else:
+        by_path = {str(e.get("path")): e for e in entries if isinstance(e, dict)}
+        for item in restore:
+            device_path = str(item.get("devicePath") or item.get("path") or "")
+            found = by_path.get(device_path)
+            if not found or int(found.get("size") or 0) != int(item.get("size") or 0):
+                result["errors"].append(f"{device_path}: size verification failed")
+
+    if cfg.get("restart_after_restore"):
+        try:
+            _device_post(ip, "/system/restart", cfg, auth)
+        except Exception:
+            pass
+
+    result["ok"] = len(result["errors"]) == 0
+    return result
+
+
+def _restore_worker(items, cfg, auth):
+    for dev, snapshot_dir, meta in items:
+        name = str(dev.get("deviceName") or dev.get("mac") or "")
+        with _RESTORE_LOCK:
+            _RESTORE_STATE["current"] = name
+        try:
+            result = _restore_snapshot(dev, snapshot_dir, meta, cfg, auth)
+        except Exception as e:
+            result = {"mac": str(dev.get("mac") or ""), "ok": False,
+                      "errors": [str(e)], "files": 0, "bytes": 0}
+        with _RESTORE_LOCK:
+            _RESTORE_STATE["results"].append(copy.deepcopy(result))
+        _broadcast_backup_event("restore_device_done",
+                                f"{name}: {'ok' if result.get('ok') else 'failed'}",
+                                device_mac=result.get("mac", ""), device_name=name,
+                                ok=bool(result.get("ok")), files=result.get("files", 0),
+                                bytes=result.get("bytes", 0),
+                                error="; ".join(result.get("errors") or []))
+    with _RESTORE_LOCK:
+        _RESTORE_STATE["running"] = False
+        _RESTORE_STATE["finishedAt"] = datetime.now(timezone.utc).isoformat()
+    _broadcast_backup_event("restore_finished", "Restore finished")
+
+
+def _start_restore(items):
+    with _RESTORE_LOCK:
+        if _RESTORE_STATE["running"]:
+            return None, "Restore already running"
+        with _BACKUP_LOCK:
+            if _BACKUP_STATE["running"]:
+                return None, "Backup already running"
+        with _FS_UPDATE_LOCK:
+            if _FS_UPDATE_STATE["running"]:
+                return None, "FS update already running"
+        _RESTORE_STATE.update({
+            "running": True, "startedAt": datetime.now(timezone.utc).isoformat(),
+            "finishedAt": None, "current": "", "results": [], "error": None,
+        })
+    cfg = _backup_settings()
+    cfg["restart_after_restore"] = bool(config.get("fs_update", {}).get(
+        "restart_after_restore", True))
+    threading.Thread(target=_restore_worker, args=(items, cfg, _device_auth()),
+                     daemon=True, name="device-restore").start()
+    return len(items), None
+
+
+def _fetch_test_status(ip, cfg, auth):
+    try:
+        resp = _device_get(ip, "/otaclient/teststatus", cfg, auth)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _fs_update_one(dev, cfg, auth):
+    mac = str(dev.get("mac") or "")
+    result = {"mac": mac, "deviceName": str(dev.get("deviceName") or mac),
+              "stage": "start", "ok": False, "oldVersionFs": "",
+              "newVersionFs": "", "snapshot": "", "errors": [], "warnings": []}
+    ip = _validate_ip(dev.get("ip"))
+    if not ip:
+        result["errors"].append("Invalid or empty IP")
+        return result
+
+    live, _, identity_error, identity_fatal = _fetch_identity(ip, cfg, auth)
+    if identity_error and identity_fatal:
+        result["errors"].append(identity_error)
+        return result
+    info, error, _ = _fetch_fs_info(ip, cfg, auth)
+    if error:
+        result["errors"].append(error)
+        return result
+    entries, _, error, _ = _fetch_fs_list(ip, cfg, auth)
+    if error:
+        result["errors"].append(error)
+        return result
+    status = _fetch_test_status(ip, cfg, auth)
+    if status is None:
+        result["errors"].append("module_otaclient not available")
+        return result
+
+    result["oldVersionFs"] = str(live.get("versionfs") or "")
+    result["stage"] = "snapshot"
+    snapshot = _backup_one_device(dev, cfg, auth, cfg["dir"], kind="fs_update",
+                                  preloaded={"live": live, "info": info,
+                                             "entries": entries, "raw_version": ""})
+    result["snapshot"] = snapshot.get("id", "")
+    if not snapshot.get("ok") or not snapshot.get("id"):
+        result["errors"].extend(snapshot.get("errors") or ["snapshot failed"])
+        return result
+    snapshot_dir = snapshot["snapshot"]
+    meta_path = os.path.join(snapshot_dir, "meta.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as e:
+        result["errors"].append(f"snapshot meta: {e}")
+        return result
+
+    old_policy = (bool(dev.get("allowFwUpdate")), bool(dev.get("allowFsUpdate")))
+    try:
+        result["stage"] = "policy"
+        device_storage.set_update_policy(mac, fw=False, fs=True)
+        result["stage"] = "check"
+        try:
+            _device_post(ip, "/otaclient/test", cfg, auth)
+        except Exception:
+            pass
+        deadline = time.time() + cfg.get("timeout_s", 10) * 6
+        update_name = ""
+        while time.time() < deadline:
+            st = _fetch_test_status(ip, cfg, auth)
+            code = (st or {}).get("code")
+            update_name = str((st or {}).get("name") or "")
+            if code == 4:
+                break
+            if code in (2, 3):
+                break
+            time.sleep(1)
+        if not update_name or "-FILESYS-" not in update_name.upper():
+            result["errors"].append("no FS update available")
+            return result
+
+        result["stage"] = "update"
+        try:
+            _device_post(ip, "/otaclient/update", cfg, auth)
+        except Exception:
+            pass
+
+        result["stage"] = "wait_version"
+        wait_deadline = time.time() + _int_value(
+            (config.get("fs_update") or {}).get("reconnect_timeout_s"), 300, 10)
+        poll = _int_value((config.get("fs_update") or {}).get("status_poll_s"), 3, 1)
+        new_versionfs = ""
+        while time.time() < wait_deadline:
+            record = device_storage.get_device_by_mac(mac)
+            if record is not None:
+                ip = _validate_ip(record.ip) or ip
+            live2, _, err2, fatal2 = _fetch_identity(ip, cfg, auth)
+            if not err2 or not fatal2:
+                new_versionfs = str(live2.get("versionfs") or "")
+                if new_versionfs and new_versionfs != result["oldVersionFs"]:
+                    break
+            time.sleep(poll)
+        result["newVersionFs"] = new_versionfs
+        if not new_versionfs or new_versionfs == result["oldVersionFs"]:
+            result["errors"].append("device did not return with new FS version")
+            return result
+
+        result["stage"] = "restore"
+        restore = _restore_snapshot(dev, snapshot_dir, meta, cfg, auth)
+        result["restore"] = restore
+        if not restore.get("ok"):
+            result["errors"].extend(restore.get("errors") or ["restore failed"])
+        result["ok"] = len(result["errors"]) == 0
+        result["stage"] = "done" if result["ok"] else "failed"
+        return result
+    finally:
+        try:
+            device_storage.set_update_policy(mac, fw=old_policy[0], fs=old_policy[1])
+        except Exception:
+            pass
+
+
+def _fs_update_worker(devices, cfg, auth):
+    for dev in devices:
+        name = str(dev.get("deviceName") or dev.get("mac") or "")
+        with _FS_UPDATE_LOCK:
+            _FS_UPDATE_STATE["current"] = name
+        try:
+            result = _fs_update_one(dev, cfg, auth)
+        except Exception as e:
+            result = {"mac": str(dev.get("mac") or ""), "deviceName": name,
+                      "stage": "failed", "ok": False, "errors": [str(e)]}
+        with _FS_UPDATE_LOCK:
+            _FS_UPDATE_STATE["results"].append(copy.deepcopy(result))
+        _broadcast_backup_event("fs_update_device_done",
+                                f"{name}: {result.get('stage')}",
+                                device_mac=result.get("mac", ""), device_name=name,
+                                ok=bool(result.get("ok")),
+                                error="; ".join(result.get("errors") or []))
+    with _FS_UPDATE_LOCK:
+        _FS_UPDATE_STATE["running"] = False
+        _FS_UPDATE_STATE["finishedAt"] = datetime.now(timezone.utc).isoformat()
+    _broadcast_backup_event("fs_update_finished", "FS update job finished")
+
+
+def _start_fs_update(macs):
+    devices = []
+    unknown = []
+    for mac in macs or []:
+        if not isinstance(mac, str):
+            continue
+        dev = device_storage.get_device_by_mac(mac.strip())
+        if dev is None:
+            unknown.append(mac)
+        else:
+            devices.append(dev.to_dict())
+    if unknown:
+        return None, "Unknown device(s): " + ", ".join(unknown)
+    if not devices:
+        return None, "No MACs provided"
+    with _FS_UPDATE_LOCK:
+        if _FS_UPDATE_STATE["running"]:
+            return None, "FS update already running"
+        with _BACKUP_LOCK:
+            if _BACKUP_STATE["running"]:
+                return None, "Backup already running"
+        with _RESTORE_LOCK:
+            if _RESTORE_STATE["running"]:
+                return None, "Restore already running"
+        _FS_UPDATE_STATE.update({
+            "running": True, "startedAt": datetime.now(timezone.utc).isoformat(),
+            "finishedAt": None, "current": "", "results": [], "error": None,
+        })
+    cfg = _backup_settings()
+    fs_cfg = config.get("fs_update") or {}
+    cfg["keep_snapshots"] = _int_value(fs_cfg.get("keep_snapshots"), 5, 0)
+    cfg["restart_after_restore"] = bool(fs_cfg.get("restart_after_restore", True))
+    threading.Thread(target=_fs_update_worker, args=(devices, cfg, _device_auth()),
+                     daemon=True, name="device-fs-update").start()
+    return len(devices), None
+
+
+def _latest_snapshot_for_mac(backup_root, mac):
+    wanted = str(mac or "").lower()
+    for item in _list_snapshots(backup_root):
+        device = item.get("device") or {}
+        if str(device.get("mac") or "").lower() != wanted:
+            continue
+        try:
+            path, meta = _snapshot_meta(backup_root, item["id"])
+            return path, meta, item
+        except Exception:
+            continue
+    return None, None, None
 
 
 # ============================================================
@@ -1747,7 +2100,8 @@ config = load_config()
 display_format = load_display_format()
 
 # Применить настройки файловых логов (папка + вкл/выкл)
-apply_logging_config(config.get("logging", DEFAULT_CONFIG["logging"]))
+if not TEST_MODE:
+    apply_logging_config(config.get("logging", DEFAULT_CONFIG["logging"]))
 if log_tee.enabled:
     log_dir = config.get("logging", {}).get("directory", "log")
     print(f"File logging enabled: logs are saved to '{os.path.join(log_dir, 'otasyncer_YYYYMMDD_HHMMSS.log')}' (hourly rotation)")
@@ -1759,7 +2113,7 @@ udp_listener = UdpListener(device_storage, sse_mgr=sse_manager, event_log=event_
 
 # Запуск UDP-слушателя
 udp_cfg = config.get("udp_listener", {})
-if udp_cfg.get("is_listening", True):
+if udp_cfg.get("is_listening", True) and not TEST_MODE:
     udp_listener.start(udp_cfg.get("receive_port", 40000))
 
 
@@ -1785,7 +2139,7 @@ def _startup_probe_worker():
         print(f"Startup probe error: {e}")
 
 
-if config.get("udp_listener", {}).get("probe_devices_on_startup", True):
+if config.get("udp_listener", {}).get("probe_devices_on_startup", True) and not TEST_MODE:
     startup_probe_thread = threading.Thread(
         target=_startup_probe_worker, daemon=True, name="udp-startup-probe"
     )
@@ -1817,8 +2171,9 @@ def _periodic_cleanup():
         except Exception as e:
             print(f"Cleanup error: {e}")
 
-cleanup_thread = threading.Thread(target=_periodic_cleanup, daemon=True, name="device-cleanup")
-cleanup_thread.start()
+if not TEST_MODE:
+    cleanup_thread = threading.Thread(target=_periodic_cleanup, daemon=True, name="device-cleanup")
+    cleanup_thread.start()
 
 
 # ============================================================
@@ -2429,6 +2784,194 @@ def api_devices_backup():
 def api_devices_backup_status():
     """API: состояние текущего/последнего бэкапа."""
     return jsonify({"success": True, "state": _backup_state_snapshot()})
+
+
+# ============================================================
+# Flask Routes — версионные снимки / восстановление / FS-update
+# ============================================================
+@app.route('/backups', methods=['GET'])
+def backups_page():
+    return render_template('backups.html')
+
+
+@app.route('/api/backups', methods=['GET'])
+def api_backups_list():
+    try:
+        root = _backup_settings()["dir"]
+        items = _list_snapshots(root)
+        mac = str(request.args.get("mac") or "").lower()
+        device = str(request.args.get("device") or "").lower()
+        kind = str(request.args.get("kind") or "").lower()
+        if mac:
+            items = [x for x in items
+                     if str((x.get("device") or {}).get("mac") or "").lower() == mac]
+        if device:
+            items = [x for x in items if str(x.get("deviceKey") or "").lower() == device]
+        if kind:
+            items = [x for x in items if str(x.get("kind") or "").lower() == kind]
+        return jsonify({"success": True, "backups": items})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/backups/<path:backup_id>', methods=['GET'])
+def api_backups_detail(backup_id):
+    try:
+        root = _backup_settings()["dir"]
+        path, meta = _snapshot_meta(root, backup_id)
+        return jsonify({"success": True, "id": backup_id, "path": path, "meta": meta})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/backups/<path:backup_id>/file', methods=['GET'])
+def api_backups_file(backup_id):
+    try:
+        root = _backup_settings()["dir"]
+        path, meta = _snapshot_meta(root, backup_id)
+        wanted = str(request.args.get("path") or "")
+        for item in meta.get("files") or []:
+            if not isinstance(item, dict):
+                continue
+            device_path = str(item.get("devicePath") or item.get("path") or "")
+            if device_path != wanted:
+                continue
+            local = os.path.abspath(os.path.join(path, str(item.get("file") or "")))
+            if os.path.commonpath([os.path.abspath(path), local]) != os.path.abspath(path):
+                return jsonify({"success": False, "error": "bad path"}), 400
+            if not os.path.isfile(local):
+                return jsonify({"success": False, "error": "file not found"}), 404
+            return send_file(local, as_attachment=True,
+                             download_name=os.path.basename(device_path))
+        return jsonify({"success": False, "error": "file not found"}), 404
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/backups/<path:backup_id>', methods=['DELETE'])
+def api_backups_delete(backup_id):
+    try:
+        root = _backup_settings()["dir"]
+        path, _ = _snapshot_meta(root, backup_id)
+        with _RESTORE_LOCK:
+            if _RESTORE_STATE.get("running"):
+                return jsonify({"success": False, "error": "restore running"}), 409
+        with _FS_UPDATE_LOCK:
+            if _FS_UPDATE_STATE.get("running"):
+                return jsonify({"success": False, "error": "FS update running"}), 409
+        shutil.rmtree(path, ignore_errors=False)
+        return jsonify({"success": True})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/backups/delete', methods=['POST'])
+def api_backups_delete_bulk():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        ids = data.get("ids")
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"success": False, "error": "ids must be a non-empty list"}), 400
+        with _RESTORE_LOCK:
+            if _RESTORE_STATE.get("running"):
+                return jsonify({"success": False, "error": "restore running"}), 409
+        with _FS_UPDATE_LOCK:
+            if _FS_UPDATE_STATE.get("running"):
+                return jsonify({"success": False, "error": "FS update running"}), 409
+        root = _backup_settings()["dir"]
+        deleted = []
+        for backup_id in ids:
+            try:
+                path, _ = _snapshot_meta(root, str(backup_id))
+                shutil.rmtree(path, ignore_errors=False)
+                deleted.append(str(backup_id))
+            except Exception:
+                continue
+        return jsonify({"success": True, "deleted": deleted})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/backups/<path:backup_id>/restore', methods=['POST'])
+def api_backups_restore(backup_id):
+    try:
+        root = _backup_settings()["dir"]
+        path, meta = _snapshot_meta(root, backup_id)
+        mac = str((meta.get("device") or {}).get("mac") or "")
+        record = device_storage.get_device_by_mac(mac)
+        if record is None:
+            return jsonify({"success": False, "error": "Device not found"}), 404
+        count, error = _start_restore([(record.to_dict(), path, meta)])
+        if error:
+            return jsonify({"success": False, "error": error}), 409
+        return jsonify({"success": True, "total": count}), 202
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/backups/restore/status', methods=['GET'])
+def api_backups_restore_status():
+    with _RESTORE_LOCK:
+        return jsonify({"success": True, "state": copy.deepcopy(_RESTORE_STATE)})
+
+
+@app.route('/api/devices/fs-restore', methods=['POST'])
+def api_devices_fs_restore():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        macs = data.get("macs")
+        if not isinstance(macs, list) or not macs:
+            return jsonify({"success": False, "error": "macs must be a non-empty list"}), 400
+        root = _backup_settings()["dir"]
+        items = []
+        missing = []
+        for mac in macs:
+            record = device_storage.get_device_by_mac(str(mac))
+            if record is None:
+                missing.append(str(mac))
+                continue
+            path, meta, _ = _latest_snapshot_for_mac(root, str(mac))
+            if not path:
+                missing.append(str(mac))
+                continue
+            items.append((record.to_dict(), path, meta))
+        if missing:
+            return jsonify({"success": False, "error": "No snapshot/device: " + ", ".join(missing)}), 404
+        count, error = _start_restore(items)
+        if error:
+            return jsonify({"success": False, "error": error}), 409
+        return jsonify({"success": True, "total": count}), 202
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/devices/fs-update', methods=['POST'])
+def api_devices_fs_update():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        macs = data.get("macs")
+        if not isinstance(macs, list) or not macs:
+            return jsonify({"success": False, "error": "macs must be a non-empty list"}), 400
+        count, error = _start_fs_update(macs)
+        if error:
+            return jsonify({"success": False, "error": error}), 409
+        return jsonify({"success": True, "total": count}), 202
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/devices/fs-update/status', methods=['GET'])
+def api_devices_fs_update_status():
+    with _FS_UPDATE_LOCK:
+        return jsonify({"success": True, "state": copy.deepcopy(_FS_UPDATE_STATE)})
 
 
 # ============================================================
